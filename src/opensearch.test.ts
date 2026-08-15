@@ -8513,76 +8513,80 @@ describe("OpenSearchRelay.recomputeScores", () => {
     referencing: Array<{ kind: number; pubkey: string; via: "e" | "q" }>;
   }) => {
     const written: Array<{ id: string; doc: Record<string, unknown> }> = [];
+    const msearchCalls: number[] = [];
 
     const client = {
       search: async () => ({
         body: { hits: { hits: opts.dirty.map((d) => ({ _source: d })) } },
       }),
       // biome-ignore lint/suspicious/noExplicitAny: test mock
-      msearch: async (requests: Array<{ body: any }>) => ({
-        body: {
-          responses: requests.map((req) => {
-            const must = req.body.query.bool.must as Array<
-              Record<string, unknown>
-            >;
-            const kinds = (
-              must.find((c) => "terms" in c) as
-                | { terms: { kind: number[] } }
-                | undefined
-            )?.terms?.kind;
-            const tagClause = must.find(
-              (c) =>
-                "term" in c &&
-                Object.keys(
-                  (c as { term: Record<string, unknown> }).term,
-                )[0].startsWith("tags_map."),
-            ) as { term: Record<string, unknown> } | undefined;
-            const via = Object.keys(tagClause?.term ?? {})[0]?.slice(
-              "tags_map.".length,
-            );
+      msearch: async (requests: Array<{ body: any }>) => {
+        msearchCalls.push(requests.length);
+        return {
+          body: {
+            responses: requests.map((req) => {
+              const must = req.body.query.bool.must as Array<
+                Record<string, unknown>
+              >;
+              const kinds = (
+                must.find((c) => "terms" in c) as
+                  | { terms: { kind: number[] } }
+                  | undefined
+              )?.terms?.kind;
+              const tagClause = must.find(
+                (c) =>
+                  "term" in c &&
+                  Object.keys(
+                    (c as { term: Record<string, unknown> }).term,
+                  )[0].startsWith("tags_map."),
+              ) as { term: Record<string, unknown> } | undefined;
+              const via = Object.keys(tagClause?.term ?? {})[0]?.slice(
+                "tags_map.".length,
+              );
 
-            const matched = opts.referencing.filter(
-              (r) => kinds?.includes(r.kind) && r.via === via,
-            );
+              const matched = opts.referencing.filter(
+                (r) => kinds?.includes(r.kind) && r.via === via,
+              );
 
-            // Trusted (WoT) mode: answer with a per-pubkey terms agg,
-            // optionally carrying the zap-amount sum per bucket.
-            if (req.body.aggs?.by_pubkey) {
-              const byPubkey = new Map<string, number>();
-              for (const r of matched) {
-                byPubkey.set(r.pubkey, (byPubkey.get(r.pubkey) ?? 0) + 1);
+              // Trusted (WoT) mode: answer with a per-pubkey terms agg,
+              // optionally carrying the zap-amount sum per bucket.
+              if (req.body.aggs?.by_pubkey) {
+                const byPubkey = new Map<string, number>();
+                for (const r of matched) {
+                  byPubkey.set(r.pubkey, (byPubkey.get(r.pubkey) ?? 0) + 1);
+                }
+                const wantsMsats = Boolean(req.body.aggs.by_pubkey.aggs);
+                const buckets = [...byPubkey.entries()].map(([key, count]) => ({
+                  key,
+                  doc_count: count,
+                  // Every zap in this fixture carries 1000 msats.
+                  ...(wantsMsats && { total_msats: { value: count * 1000 } }),
+                }));
+                return {
+                  hits: { total: { value: matched.length } },
+                  aggregations: { by_pubkey: { buckets } },
+                };
               }
-              const wantsMsats = Boolean(req.body.aggs.by_pubkey.aggs);
-              const buckets = [...byPubkey.entries()].map(([key, count]) => ({
-                key,
-                doc_count: count,
+
+              const aggs: Record<string, { value: number }> = {};
+              if (req.body.aggs?.total_msats) {
                 // Every zap in this fixture carries 1000 msats.
-                ...(wantsMsats && { total_msats: { value: count * 1000 } }),
-              }));
+                aggs.total_msats = { value: matched.length * 1000 };
+              }
+              if (req.body.aggs?.unique_authors) {
+                aggs.unique_authors = {
+                  value: new Set(matched.map((r) => r.pubkey)).size,
+                };
+              }
+
               return {
                 hits: { total: { value: matched.length } },
-                aggregations: { by_pubkey: { buckets } },
+                ...(Object.keys(aggs).length > 0 && { aggregations: aggs }),
               };
-            }
-
-            const aggs: Record<string, { value: number }> = {};
-            if (req.body.aggs?.total_msats) {
-              // Every zap in this fixture carries 1000 msats.
-              aggs.total_msats = { value: matched.length * 1000 };
-            }
-            if (req.body.aggs?.unique_authors) {
-              aggs.unique_authors = {
-                value: new Set(matched.map((r) => r.pubkey)).size,
-              };
-            }
-
-            return {
-              hits: { total: { value: matched.length } },
-              ...(Object.keys(aggs).length > 0 && { aggregations: aggs }),
-            };
-          }),
-        },
-      }),
+            }),
+          },
+        };
+      },
       bulk: async ({ body }: { body: unknown[] }) => {
         for (let i = 0; i < body.length; i += 2) {
           const action = body[i] as { update?: { _id: string } };
@@ -8595,7 +8599,7 @@ describe("OpenSearchRelay.recomputeScores", () => {
       },
     };
 
-    return { client, written };
+    return { client, written, msearchCalls };
   };
 
   it("maps each engagement sub-query onto its score field", async () => {
@@ -8731,6 +8735,38 @@ describe("OpenSearchRelay.recomputeScores", () => {
     const write = written.find((w) => w.id === targetId);
     assert.ok(write);
     assert.equal(write.doc.engagers, 1);
+  });
+
+  it("chunks the engagement msearch so a large dirty batch can't time out", async () => {
+    // 150 dirty events × 6 sub-queries = 900 requests, which must be split
+    // across more than one msearch (chunk size is 600) rather than sent as
+    // one oversized call — the payload that timed out in production and
+    // discarded the whole drained batch.
+    const ids = Array.from({ length: 150 }, (_, i) =>
+      i.toString(16).padStart(64, "0"),
+    );
+    const { client, written, msearchCalls } = createScoreMockClient({
+      dirty: ids.map((id) => ({ id, kind: 1, pubkey: "b".repeat(64) })),
+      referencing: [{ kind: 7, pubkey: "c".repeat(64), via: "e" }],
+    });
+
+    const relay = new OpenSearchRelay(client as unknown as Client, {
+      indexName: "test-index",
+    });
+    relay.addDirtyIds(ids);
+
+    const result = await relay.recomputeScores();
+
+    // Every event was scored despite spanning multiple msearch calls.
+    assert.equal(result.count, 150);
+    assert.equal(written.length, 150);
+    for (const id of ids) {
+      assert.equal(result.eventScores.get(id)?.reaction_cnt, 1);
+    }
+
+    // More than one msearch, and no single call exceeded the chunk cap.
+    assert.ok(msearchCalls.length > 1, "expected the msearch to be chunked");
+    assert.ok(Math.max(...msearchCalls) <= 600);
   });
 
   it("falls back to unfiltered counting when the provider returns undefined", async () => {

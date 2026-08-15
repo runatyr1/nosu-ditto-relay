@@ -176,6 +176,20 @@ export type TrustProvider = () => ReadonlySet<string> | undefined;
 const TRUSTED_PUBKEY_AGG_SIZE = 3000;
 
 /**
+ * Maximum sub-requests per `_msearch` call issued by `recomputeScores`.
+ *
+ * The engagement phase issues 6 sub-queries per dirty event; sending every
+ * dirty event's sub-queries in one msearch is fine for the small batches
+ * of steady-state operation, but a large dirty burst — the WoT seed
+ * re-dirty of thousands of events, or an engagement flood — produces a
+ * payload big enough to time out the whole call, and since the dirty set
+ * is already drained that discards the entire batch. Chunking bounds each
+ * call; responses are concatenated in request order so the positional
+ * readout is unaffected. 600 ≈ 100 events per engagement msearch.
+ */
+const RECOMPUTE_MSEARCH_CHUNK = 600;
+
+/**
  * A bucket of the per-pubkey `terms` agg used in trusted mode. The
  * optional `total_msats` sub-agg is only present on the zap sub-query.
  */
@@ -3095,6 +3109,27 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
    * Designed to be called periodically (e.g. via setInterval).
    * Returns the computed scores so callers (e.g. NIP-85) can publish them.
    */
+  /**
+   * Run an `_msearch` in chunks of at most {@link RECOMPUTE_MSEARCH_CHUNK}
+   * sub-requests, concatenating the responses in request order.
+   *
+   * Chunks run sequentially: the goal is to keep any single OpenSearch call
+   * small enough not to time out under a large dirty burst, not to add
+   * concurrent load. The returned array lines up 1:1 with `searches`, so
+   * positional readouts are unaffected.
+   */
+  private async msearchChunked(
+    searches: Array<{ index: string; body: unknown }>,
+  ): Promise<Array<MsearchResponseItem | undefined>> {
+    const responses: Array<MsearchResponseItem | undefined> = [];
+    for (let i = 0; i < searches.length; i += RECOMPUTE_MSEARCH_CHUNK) {
+      const chunk = searches.slice(i, i + RECOMPUTE_MSEARCH_CHUNK);
+      const result = await this.client.msearch(chunk);
+      responses.push(...result.body.responses);
+    }
+    return responses;
+  }
+
   async recomputeScores(): Promise<RecomputeResult> {
     // Phase 1: Drain in-memory pending dirty sets and fetch the
     // corresponding events from OpenSearch. By now these documents have
@@ -3217,12 +3252,12 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         },
       }));
 
-      const followerResult = await this.client.msearch(followerSearches);
+      const followerResponses = await this.msearchChunked(followerSearches);
 
       for (let i = 0; i < dirtyKind0.length; i++) {
         const s = scores.get(dirtyKind0[i].id);
         if (!s) continue;
-        const resp = followerResult.body.responses[i];
+        const resp = followerResponses[i];
         s.followers = resp?.hits?.total?.value ?? 0;
       }
     }
@@ -3295,8 +3330,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         }
       }
 
-      const engagementResult = await this.client.msearch(engagementSearches);
-      const responses = engagementResult.body.responses;
+      const responses = await this.msearchChunked(engagementSearches);
 
       for (let i = 0; i < dirtyNonKind0Ids.length; i++) {
         const s = scores.get(dirtyNonKind0Ids[i]);
