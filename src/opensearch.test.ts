@@ -8545,6 +8545,26 @@ describe("OpenSearchRelay.recomputeScores", () => {
               (r) => kinds?.includes(r.kind) && r.via === via,
             );
 
+            // Trusted (WoT) mode: answer with a per-pubkey terms agg,
+            // optionally carrying the zap-amount sum per bucket.
+            if (req.body.aggs?.by_pubkey) {
+              const byPubkey = new Map<string, number>();
+              for (const r of matched) {
+                byPubkey.set(r.pubkey, (byPubkey.get(r.pubkey) ?? 0) + 1);
+              }
+              const wantsMsats = Boolean(req.body.aggs.by_pubkey.aggs);
+              const buckets = [...byPubkey.entries()].map(([key, count]) => ({
+                key,
+                doc_count: count,
+                // Every zap in this fixture carries 1000 msats.
+                ...(wantsMsats && { total_msats: { value: count * 1000 } }),
+              }));
+              return {
+                hits: { total: { value: matched.length } },
+                aggregations: { by_pubkey: { buckets } },
+              };
+            }
+
             const aggs: Record<string, { value: number }> = {};
             if (req.body.aggs?.total_msats) {
               // Every zap in this fixture carries 1000 msats.
@@ -8667,5 +8687,114 @@ describe("OpenSearchRelay.recomputeScores", () => {
     const result = await relay.recomputeScores();
     assert.equal(result.count, 0);
     assert.equal(result.eventScores.size, 0);
+  });
+
+  it("counts only trusted authors when a trust provider is active", async () => {
+    const targetId = "a".repeat(64);
+    const trustedPk = "c".repeat(64);
+    const puppet1 = "d".repeat(64);
+    const puppet2 = "e".repeat(64);
+
+    const { client, written } = createScoreMockClient({
+      dirty: [{ id: targetId, kind: 1, pubkey: "b".repeat(64) }],
+      referencing: [
+        // Trusted: one comment and one zap.
+        { kind: 1, pubkey: trustedPk, via: "e" },
+        { kind: 9735, pubkey: trustedPk, via: "e" },
+        // Sybil swarm: reactions, a repost, a quote, and a zap.
+        { kind: 7, pubkey: puppet1, via: "e" },
+        { kind: 7, pubkey: puppet2, via: "e" },
+        { kind: 6, pubkey: puppet1, via: "e" },
+        { kind: 1, pubkey: puppet2, via: "q" },
+        { kind: 9735, pubkey: puppet2, via: "e" },
+      ],
+    });
+
+    const relay = new OpenSearchRelay(client as unknown as Client, {
+      indexName: "test-index",
+    });
+    relay.trustProvider = () => new Set([trustedPk]);
+    relay.addDirtyIds([targetId]);
+
+    const result = await relay.recomputeScores();
+
+    const scores = result.eventScores.get(targetId);
+    assert.ok(scores);
+    assert.equal(scores.comment_cnt, 1);
+    assert.equal(scores.reaction_cnt, 0);
+    assert.equal(scores.repost_cnt, 0);
+    assert.equal(scores.quote_cnt, 0);
+    assert.equal(scores.zap_cnt, 1);
+    assert.equal(scores.zap_amount_msats, 1000);
+
+    // Only the trusted pubkey counts as an engager, not the puppets.
+    const write = written.find((w) => w.id === targetId);
+    assert.ok(write);
+    assert.equal(write.doc.engagers, 1);
+  });
+
+  it("falls back to unfiltered counting when the provider returns undefined", async () => {
+    const targetId = "a".repeat(64);
+    const { client, written } = createScoreMockClient({
+      dirty: [{ id: targetId, kind: 1, pubkey: "b".repeat(64) }],
+      referencing: [
+        { kind: 7, pubkey: "c".repeat(64), via: "e" },
+        { kind: 7, pubkey: "d".repeat(64), via: "e" },
+      ],
+    });
+
+    const relay = new OpenSearchRelay(client as unknown as Client, {
+      indexName: "test-index",
+    });
+    // WoT configured but first refresh hasn't completed yet.
+    relay.trustProvider = () => undefined;
+    relay.addDirtyIds([targetId]);
+
+    const result = await relay.recomputeScores();
+
+    assert.equal(result.eventScores.get(targetId)?.reaction_cnt, 2);
+    assert.equal(written.find((w) => w.id === targetId)?.doc.engagers, 2);
+  });
+});
+
+describe("OpenSearchRelay.seedDirtyEngaged", () => {
+  it("queues recent engaged event IDs as dirty", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const client = {
+      search: async (req: { body: Record<string, unknown> }) => {
+        captured = req.body;
+        return {
+          body: {
+            hits: {
+              hits: [
+                { _source: { id: "1".repeat(64) } },
+                { _source: { id: "2".repeat(64) } },
+              ],
+            },
+          },
+        };
+      },
+    };
+
+    const relay = new OpenSearchRelay(client as unknown as Client, {
+      indexName: "test-index",
+    });
+
+    const count = await relay.seedDirtyEngaged(500);
+
+    assert.equal(count, 2);
+    assert.deepEqual(relay.drainDirty().ids.sort(), [
+      "1".repeat(64),
+      "2".repeat(64),
+    ]);
+
+    // The query is bounded: engaged-only, recent-only, top-N by engagers.
+    assert.ok(captured);
+    assert.equal(captured.size, 500);
+    const must = (captured.query as { bool: { must: unknown[] } }).bool.must;
+    assert.ok(
+      must.some((c) => JSON.stringify(c).includes('"engagers":{"gt":0}')),
+    );
+    assert.ok(must.some((c) => JSON.stringify(c).includes("created_at")));
   });
 });

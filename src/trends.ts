@@ -4,7 +4,23 @@ import type {
   NostrSigner,
   NStore,
 } from "@nostrify/nostrify";
+import type { TrustProvider } from "./opensearch.ts";
 import type { Client } from "./opensearch-client.ts";
+
+/**
+ * Maximum authors returned per tag-value bucket in trusted (WoT) mode.
+ * Values used by more unique authors than this are undercounted; only
+ * sybil-swarmed values realistically get near the cap.
+ */
+const TRUSTED_AUTHOR_AGG_SIZE = 1000;
+
+/**
+ * Bucket over-fetch factor in trusted mode. Buckets come back ordered by
+ * raw doc count, so a value pumped by untrusted authors can crowd trusted
+ * values out of the top `limit` buckets; over-fetching gives the
+ * client-side trusted re-sort real candidates to work with.
+ */
+const TRUSTED_BUCKET_OVERFETCH = 5;
 
 /** A single trending tag value with engagement metrics. */
 export interface TrendingTagValue {
@@ -26,6 +42,12 @@ export interface TrendsOpts {
   relay: NStore;
   /** Optional callback to broadcast events to connected WebSocket subscribers. */
   broadcast?: (event: NostrEvent) => void;
+  /**
+   * Optional web-of-trust provider. When it returns a set, only trusted
+   * authors count toward `authors`/`uses` and untrusted-only values are
+   * dropped from the trend list entirely.
+   */
+  trustProvider?: TrustProvider;
 }
 
 /**
@@ -38,12 +60,14 @@ export class Trends {
   private indexName: string;
   private relay: NStore;
   private broadcast?: (event: NostrEvent) => void;
+  private trustProvider?: TrustProvider;
 
   constructor(opts: TrendsOpts) {
     this.client = opts.client;
     this.indexName = opts.indexName;
     this.relay = opts.relay;
     this.broadcast = opts.broadcast;
+    this.trustProvider = opts.trustProvider;
   }
 
   /**
@@ -91,6 +115,14 @@ export class Trends {
     // We need to run one aggregation per tag name (e.g. "e" and "q"), then
     // merge the buckets client-side.  Each tag name maps to a different
     // `tags_map.<name>` keyword field in OpenSearch.
+    //
+    // In trusted (WoT) mode each value bucket returns its authors as a
+    // terms sub-agg instead of a cardinality, so the readout can count
+    // only trusted ones — and buckets are over-fetched because the raw
+    // doc-count ordering is exactly what sybil swarms inflate.
+    const trusted = this.trustProvider?.();
+    const bucketSize =
+      limit * tagNames.length * (trusted ? TRUSTED_BUCKET_OVERFETCH : 1);
     const aggs: Record<string, unknown> = {};
 
     for (const tagName of tagNames) {
@@ -108,13 +140,22 @@ export class Trends {
           values: {
             terms: {
               field,
-              size: limit * tagNames.length, // over-fetch to allow merging
+              size: bucketSize,
             },
-            aggs: {
-              unique_authors: {
-                cardinality: { field: "pubkey" },
-              },
-            },
+            aggs: trusted
+              ? {
+                  authors: {
+                    terms: {
+                      field: "pubkey",
+                      size: TRUSTED_AUTHOR_AGG_SIZE,
+                    },
+                  },
+                }
+              : {
+                  unique_authors: {
+                    cardinality: { field: "pubkey" },
+                  },
+                },
           },
         },
       };
@@ -143,6 +184,9 @@ export class Trends {
                 key: string;
                 doc_count: number;
                 unique_authors?: { value: number };
+                authors?: {
+                  buckets?: Array<{ key: string; doc_count: number }>;
+                };
               }>;
             };
           }
@@ -154,9 +198,24 @@ export class Trends {
         const key = bucket.key.toLowerCase();
         // Marker tags with no value are indexed as '' — never trend those.
         if (!key) continue;
+
+        let authors: number;
+        let uses: number;
+        if (trusted) {
+          // Only trusted authors count; a value used exclusively by
+          // untrusted pubkeys never trends at all.
+          const authorBuckets = (bucket.authors?.buckets ?? []).filter((b) =>
+            trusted.has(b.key),
+          );
+          authors = authorBuckets.length;
+          uses = authorBuckets.reduce((sum, b) => sum + b.doc_count, 0);
+          if (authors === 0) continue;
+        } else {
+          authors = bucket.unique_authors?.value ?? 0;
+          uses = bucket.doc_count;
+        }
+
         const existing = merged.get(key);
-        const authors = bucket.unique_authors?.value ?? 0;
-        const uses = bucket.doc_count;
 
         if (existing) {
           existing.authors = Math.max(existing.authors, authors);

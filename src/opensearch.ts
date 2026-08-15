@@ -158,6 +158,34 @@ const ENGAGEMENT_QUERIES = [
 const DECAY_SORT_WINDOW_SECONDS = 7 * 24 * 3600;
 
 /**
+ * Provides the current set of trusted pubkeys for engagement counting, or
+ * `undefined` when trust filtering is inactive (no WoT configured, or the
+ * first WoT computation hasn't completed). Consulted per recompute tick so
+ * a refreshed set applies without re-wiring.
+ */
+export type TrustProvider = () => ReadonlySet<string> | undefined;
+
+/**
+ * Maximum unique engager pubkeys returned per engagement sub-query in
+ * trusted (WoT) mode, where each sub-query returns a per-pubkey `terms`
+ * agg instead of a hit count so the readout can drop untrusted authors.
+ * Events with more unique engaging pubkeys than this are undercounted —
+ * in practice only sybil swarms get near the cap, and undercounting a
+ * swarm is the desired direction.
+ */
+const TRUSTED_PUBKEY_AGG_SIZE = 3000;
+
+/**
+ * A bucket of the per-pubkey `terms` agg used in trusted mode. The
+ * optional `total_msats` sub-agg is only present on the zap sub-query.
+ */
+interface PubkeyBucket {
+  key: string;
+  doc_count: number;
+  total_msats?: { value?: number };
+}
+
+/**
  * OpenSearch document structure for Nostr events
  */
 interface NostrEventDocument extends NostrEvent {
@@ -361,6 +389,18 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
    * (NIP-73 identifiers) that need NIP-85 stats updates.
    */
   onDirtyIdentifiers?: (identifiers: Set<string>) => void;
+
+  /**
+   * Optional web-of-trust provider consulted by {@link recomputeScores}.
+   * When it returns a set, engagement sub-queries switch from raw counts
+   * to per-pubkey aggregations and only trusted authors contribute to the
+   * score fields. Assigned by the background worker after construction;
+   * `undefined` (or a provider returning `undefined`) keeps the unfiltered
+   * behavior. Kind 0 `followers` counts are NOT filtered — popular
+   * profiles have follower counts far beyond any per-pubkey agg size, so
+   * filtering them needs a different mechanism.
+   */
+  trustProvider?: TrustProvider;
 
   /**
    * Add event IDs to the pending dirty set for score recomputation.
@@ -3197,12 +3237,21 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     //   3: zap count + amount (kind 9735 via tags_map.e, with sum agg)
     //   4: quote count (kind 1 via tags_map.q)
     //   5: unique engagers (all engagement kinds via tags_map.e, cardinality agg)
+    // When a trust provider is active, the same six queries are issued but
+    // each returns a per-pubkey terms agg instead, and only trusted
+    // authors contribute to the counts.
     if (dirtyNonKind0Ids.length > 0) {
       const QUERIES_PER_EVENT = ENGAGEMENT_QUERIES.length;
       const baseMust = [
         { term: { deleted: false } },
         { term: { replaced: false } },
       ];
+
+      // Trusted (WoT) mode: instead of reading hit counts, each sub-query
+      // returns a per-pubkey terms agg so the readout below can count only
+      // trusted authors. The zap sub-query nests its amount sum per pubkey
+      // for the same reason.
+      const trusted = this.trustProvider?.();
 
       const engagementSearches: Array<{ index: string; body: unknown }> = [];
 
@@ -3221,9 +3270,26 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
                 },
               },
               size: 0,
-              // Only queries whose hit count is read need an exact total.
-              ...(q.field !== undefined && { track_total_hits: true }),
-              ...("agg" in q && { aggs: { [q.agg.name]: q.agg.body } }),
+              ...(trusted
+                ? {
+                    aggs: {
+                      by_pubkey: {
+                        terms: {
+                          field: "pubkey",
+                          size: TRUSTED_PUBKEY_AGG_SIZE,
+                        },
+                        ...("agg" in q &&
+                          q.agg.into === "zap_amount_msats" && {
+                            aggs: { total_msats: q.agg.body },
+                          }),
+                      },
+                    },
+                  }
+                : {
+                    // Only queries whose hit count is read need an exact total.
+                    ...(q.field !== undefined && { track_total_hits: true }),
+                    ...("agg" in q && { aggs: { [q.agg.name]: q.agg.body } }),
+                  }),
             },
           });
         }
@@ -3240,14 +3306,38 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
 
         ENGAGEMENT_QUERIES.forEach((q, j) => {
           const resp: MsearchResponseItem | undefined = responses[base + j];
-          if (q.field !== undefined) {
-            s[q.field] = resp?.hits?.total?.value ?? 0;
-          }
-          if ("agg" in q) {
+          if (trusted) {
+            // Count only buckets whose pubkey is in the trusted set. The
+            // engagers entry counts trusted bucket keys (unique authors);
+            // everything else sums doc counts (events) over them.
             const aggs = resp?.aggregations as
-              | Record<string, { value?: number } | undefined>
+              | { by_pubkey?: { buckets?: PubkeyBucket[] } }
               | undefined;
-            s[q.agg.into] = aggs?.[q.agg.name]?.value ?? 0;
+            const buckets = (aggs?.by_pubkey?.buckets ?? []).filter((b) =>
+              trusted.has(b.key),
+            );
+            if (q.field !== undefined) {
+              s[q.field] = buckets.reduce((sum, b) => sum + b.doc_count, 0);
+            }
+            if ("agg" in q) {
+              s[q.agg.into] =
+                q.agg.into === "engagers"
+                  ? buckets.length
+                  : buckets.reduce(
+                      (sum, b) => sum + (b.total_msats?.value ?? 0),
+                      0,
+                    );
+            }
+          } else {
+            if (q.field !== undefined) {
+              s[q.field] = resp?.hits?.total?.value ?? 0;
+            }
+            if ("agg" in q) {
+              const aggs = resp?.aggregations as
+                | Record<string, { value?: number } | undefined>
+                | undefined;
+              s[q.agg.into] = aggs?.[q.agg.name]?.value ?? 0;
+            }
           }
         });
       }
@@ -3336,6 +3426,50 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     }
 
     return { count: allDirtyIds.length, userScores, eventScores };
+  }
+
+  /**
+   * Queue the most-engaged recent events for score recomputation.
+   *
+   * Called by the background worker after the first WoT refresh so that
+   * scores computed before trust filtering was active are recomputed under
+   * it — otherwise an already-boosted sybil post would keep its inflated
+   * `engagers` until its next organic engagement re-dirties it. Bounded to
+   * the decay-sort window (older events score ~0 in sort:hot anyway) and
+   * to the top `max` by `engagers`, which covers everything that could
+   * surface in a sorted view.
+   */
+  async seedDirtyEngaged(max = 2000): Promise<number> {
+    const now = Math.floor(Date.now() / 1000);
+
+    const response = await this.client.search<{ id: string }>({
+      index: this.indexName,
+      body: {
+        query: {
+          bool: {
+            must: [
+              { term: { deleted: false } },
+              { term: { replaced: false } },
+              {
+                range: {
+                  created_at: { gte: now - DECAY_SORT_WINDOW_SECONDS },
+                },
+              },
+              { range: { engagers: { gt: 0 } } },
+            ],
+          },
+        },
+        sort: [{ engagers: { order: "desc" as const } }],
+        _source: ["id"],
+        size: max,
+      },
+    });
+
+    const ids = response.body.hits.hits.flatMap((h) =>
+      h._source?.id ? [h._source.id] : [],
+    );
+    this.addDirtyIds(ids);
+    return ids.length;
   }
 
   /**

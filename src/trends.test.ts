@@ -161,20 +161,44 @@ function createMockClient() {
           }
         }
 
-        // Build response buckets
+        // Build response buckets. The sub-agg decides the shape: trusted
+        // mode asks for a per-pubkey `authors` terms agg, the default asks
+        // for a `unique_authors` cardinality.
+        const wantsAuthors = Boolean(
+          (termsAgg.aggs as Record<string, unknown> | undefined)?.authors,
+        );
+
         const buckets: Array<{
           key: string;
           doc_count: number;
-          unique_authors: { value: number };
+          unique_authors?: { value: number };
+          authors?: { buckets: Array<{ key: string; doc_count: number }> };
         }> = [];
 
         for (const [key, bucket] of valueBuckets.entries()) {
-          const uniquePubkeys = new Set(bucket.docs.map((d) => d.pubkey));
-          buckets.push({
-            key,
-            doc_count: bucket.docs.length,
-            unique_authors: { value: uniquePubkeys.size },
-          });
+          if (wantsAuthors) {
+            const byPubkey = new Map<string, number>();
+            for (const doc of bucket.docs) {
+              byPubkey.set(doc.pubkey, (byPubkey.get(doc.pubkey) ?? 0) + 1);
+            }
+            buckets.push({
+              key,
+              doc_count: bucket.docs.length,
+              authors: {
+                buckets: [...byPubkey.entries()].map(([pk, count]) => ({
+                  key: pk,
+                  doc_count: count,
+                })),
+              },
+            });
+          } else {
+            const uniquePubkeys = new Set(bucket.docs.map((d) => d.pubkey));
+            buckets.push({
+              key,
+              doc_count: bucket.docs.length,
+              unique_authors: { value: uniquePubkeys.size },
+            });
+          }
         }
 
         // Sort by doc_count desc and limit
@@ -250,10 +274,15 @@ function createMockSigner(pubkey: string): NostrSigner {
 }
 
 /** Helper to create a Trends instance with mock dependencies. */
-function createTrends() {
+function createTrends(opts?: { trusted?: ReadonlySet<string> }) {
   const { client, documents, addEvent } = createMockClient();
   const relay = createMockRelay();
-  const trends = new Trends({ client, indexName: "test-index", relay });
+  const trends = new Trends({
+    client,
+    indexName: "test-index",
+    relay,
+    ...(opts?.trusted && { trustProvider: () => opts.trusted }),
+  });
   return { trends, client, documents, addEvent, relay };
 }
 
@@ -877,6 +906,92 @@ describe("Trends", () => {
       assert.equal(results[1].value, "bitcoin");
       assert.equal(results[1].authors, 1);
       assert.equal(results[1].uses, 5);
+    });
+  });
+
+  describe("getTrendingTagValues with trust provider", () => {
+    it("counts only trusted authors and drops untrusted-only values", async () => {
+      const trustedA = "a".repeat(64);
+      const trustedB = "b".repeat(64);
+      const puppet1 = "c".repeat(64);
+      const puppet2 = "d".repeat(64);
+      const puppet3 = "e".repeat(64);
+
+      const { trends, addEvent } = createTrends({
+        trusted: new Set([trustedA, trustedB]),
+      });
+      const now = Math.floor(Date.now() / 1000);
+
+      // #organic: two trusted authors, one puppet.
+      for (const [pubkey, offset] of [
+        [trustedA, 0],
+        [trustedB, 10],
+        [puppet1, 20],
+      ] as const) {
+        addEvent(
+          fakeEvent({
+            pubkey,
+            kind: 1,
+            created_at: now - offset,
+            tags: [["t", "organic"]],
+          }),
+        );
+      }
+
+      // #botted: three puppets, zero trusted authors — more raw authors
+      // and uses than #organic, but it must not trend at all.
+      for (const [pubkey, offset] of [
+        [puppet1, 0],
+        [puppet2, 5],
+        [puppet2, 15],
+        [puppet3, 25],
+      ] as const) {
+        addEvent(
+          fakeEvent({
+            pubkey,
+            kind: 1,
+            created_at: now - offset,
+            tags: [["t", "botted"]],
+          }),
+        );
+      }
+
+      const results = await trends.getTrendingTagValues(["t"], {
+        kinds: [1],
+        since: now - 3600,
+        until: now,
+        limit: 10,
+      });
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].value, "organic");
+      // Puppet contributions are excluded from both counts.
+      assert.equal(results[0].authors, 2);
+      assert.equal(results[0].uses, 2);
+    });
+
+    it("counts every author when no trust provider is configured", async () => {
+      const { trends, addEvent } = createTrends();
+      const now = Math.floor(Date.now() / 1000);
+
+      addEvent(
+        fakeEvent({
+          pubkey: "a".repeat(64),
+          kind: 1,
+          created_at: now,
+          tags: [["t", "anything"]],
+        }),
+      );
+
+      const results = await trends.getTrendingTagValues(["t"], {
+        kinds: [1],
+        since: now - 3600,
+        until: now,
+        limit: 10,
+      });
+
+      assert.equal(results.length, 1);
+      assert.equal(results[0].authors, 1);
     });
   });
 

@@ -240,6 +240,7 @@ All options:
 | `HISTORY_KINDS_WHITELIST` | Only these kinds get history | unset |
 | `HISTORY_KINDS_EXCLUDED` | Kinds excluded from history | `30382,30383,30384,30385` |
 | `STATS_ENABLED` | Enable background worker (scores, NIP-85, trends) | `true` |
+| `WOT_SEED_PUBKEYS` | Hex pubkeys seeding the web of trust for engagement scores and trends (2 follow-hops; unset = count everyone) | unset |
 | `TRENDS_INTERVAL_MS` | Interval between trend computations (`0` disables) | `900000` |
 | `DITTO_LANGUAGES` | ISO 639-1 codes for per-language trends | unset |
 | `REJECTED_KINDS` | Kinds rejected at ingestion | `13,9734,20013,20014,22242,24242,27235` |

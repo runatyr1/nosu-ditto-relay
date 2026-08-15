@@ -19,9 +19,10 @@ import type { NostrEvent } from "nostr-tools";
 import { Config } from "./config.ts";
 import { errFields, Logger } from "./log.ts";
 import { Nip85 } from "./nip85.ts";
-import { OpenSearchRelay } from "./opensearch.ts";
+import { OpenSearchRelay, type TrustProvider } from "./opensearch.ts";
 import { Client as OpenSearchClient } from "./opensearch-client.ts";
 import { Trends } from "./trends.ts";
+import { Wot } from "./wot.ts";
 
 declare var self: Worker;
 
@@ -66,6 +67,67 @@ const relay = new OpenSearchRelay(readClient, {
 
 const signer = config.nostrSigner;
 
+// ---------------------------------------------------------------------------
+// Web of trust (optional, only with configured seeds)
+//
+// Expanded from WOT_SEED_PUBKEYS via kind 3 contact lists in the local
+// index. While active, only trusted pubkeys count toward engagement scores
+// and trends — the sybil-resistance layer for sort:hot/top and trending.
+// The provider returns undefined until the first refresh completes, so
+// early recompute ticks fall back to unfiltered counting rather than
+// zeroing every score.
+// ---------------------------------------------------------------------------
+
+const WOT_REFRESH_INTERVAL_MS = 3_600_000;
+
+let trustProvider: TrustProvider | undefined;
+if (config.wotSeedPubkeys.size > 0) {
+  const wot = new Wot({
+    relay,
+    seeds: config.wotSeedPubkeys,
+    logger: log,
+  });
+  trustProvider = () => wot.trusted();
+  relay.trustProvider = trustProvider;
+
+  /** Guards against overlapping refreshes, as in the loops below. */
+  let wotInFlight = false;
+  /** Set once after the first successful refresh (re-dirty trigger). */
+  let wotSeeded = false;
+
+  const refreshWot = () => {
+    if (wotInFlight) {
+      log.debug("wot_refresh_skipped_overlap");
+      return;
+    }
+    wotInFlight = true;
+    wot
+      .refresh()
+      .then(async () => {
+        // Scores computed before trust filtering became active are stale
+        // (sybil-inflated); re-dirty the most-engaged recent events once
+        // so the next recompute ticks rewrite them under the WoT.
+        if (!wotSeeded) {
+          wotSeeded = true;
+          const count = await relay.seedDirtyEngaged();
+          log.info("wot_seeded_dirty", { count });
+        }
+      })
+      .catch((err) => log.error("wot_refresh_failed", errFields(err)))
+      .finally(() => {
+        wotInFlight = false;
+      });
+  };
+
+  refreshWot();
+  setInterval(refreshWot, WOT_REFRESH_INTERVAL_MS);
+
+  log.info("wot_scheduled", {
+    seeds: config.wotSeedPubkeys.size,
+    interval_ms: WOT_REFRESH_INTERVAL_MS,
+  });
+}
+
 /**
  * Post a NostrEvent back to the main thread for WebSocket broadcast.
  *
@@ -109,6 +171,7 @@ if (trendsIntervalMs > 0) {
     indexName: config.opensearchIndex,
     relay,
     broadcast: broadcastToMain,
+    trustProvider,
   });
 }
 

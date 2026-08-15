@@ -332,6 +332,42 @@ describe("Config", () => {
     });
   });
 
+  describe("wotSeedPubkeys", () => {
+    const hex =
+      "4b1b7f0d17e5ee24ccd091afacfe7923329c21387f1f3ee14c3cf3fa31e2a813";
+
+    it("should default to an empty set when not set", () => {
+      const config = new Config(baseEnv());
+      assert.deepEqual(config.wotSeedPubkeys, new Set());
+    });
+
+    it("should parse a comma-separated list of hex pubkeys", () => {
+      const config = new Config(
+        baseEnv([["WOT_SEED_PUBKEYS", `${hex},${"a".repeat(64)}`]]),
+      );
+      assert.deepEqual(config.wotSeedPubkeys, new Set([hex, "a".repeat(64)]));
+    });
+
+    it("should lowercase and trim hex entries", () => {
+      const config = new Config(
+        baseEnv([["WOT_SEED_PUBKEYS", ` ${hex.toUpperCase()} `]]),
+      );
+      assert.deepEqual(config.wotSeedPubkeys, new Set([hex]));
+    });
+
+    it("should return an empty set for an empty string", () => {
+      const config = new Config(baseEnv([["WOT_SEED_PUBKEYS", ""]]));
+      assert.deepEqual(config.wotSeedPubkeys, new Set());
+    });
+
+    it("should throw on a non-hex entry", () => {
+      assert.throws(
+        () => new Config(baseEnv([["WOT_SEED_PUBKEYS", "not-a-pubkey"]])),
+        /WOT_SEED_PUBKEYS/,
+      );
+    });
+  });
+
   describe("bannedHashtags", () => {
     it("should default to an empty set when not set", () => {
       const config = new Config(baseEnv());

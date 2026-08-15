@@ -100,7 +100,9 @@ the hot path.
 │   ├── autocomplete-text.ts      # Shared buildAutocompleteText for edge-ngram autocomplete indexing
 │   ├── autocomplete-text.test.ts # Autocomplete text tests
 │   ├── trends.ts           # Trending tag computation and publishing
-│   └── trends.test.ts      # Trends tests
+│   ├── trends.test.ts      # Trends tests
+│   ├── wot.ts              # Web-of-trust set from kind 3 follow graphs
+│   └── wot.test.ts         # WoT tests
 ├── scripts/
 │   ├── analyze-client.ts          # Analyze a client's users (active/inactive, engagement, cohorts)
 │   ├── backfill-client-address.ts # Backfill client field (NIP-89 client address) for existing events
@@ -168,8 +170,19 @@ Edit `.env` to configure the application:
   connection that authenticates (NIP-42) as any of these gets unconditional
   read access to all `AUTH_KINDS` events for every user — bypassing all AUTH
   gating on REQ/COUNT/NEG-OPEN and live subscriptions, including catch-all
-  filters. Intended for operator-controlled services such as bridges and
+  filters.   Intended for operator-controlled services such as bridges and
   notification servers. Default: empty (no master pubkeys).
+- `WOT_SEED_PUBKEYS` - Comma-separated hex pubkeys seeding the engagement
+  web of trust. The background worker expands them 2 follow-hops via kind 3
+  contact lists in the local index (hourly); while the set is available,
+  only pubkeys inside it count toward engagement scores (`engagers`,
+  comment/reaction/repost/quote/zap counts — the inputs to `sort:hot`,
+  `sort:top`, etc.) and trending aggregations, so sybil swarms can't farm
+  hot posts or trends. Seeds should be real accounts with meaningful follow
+  graphs (e.g. the operator's personal account) — NOT the `MASTER_PUBKEYS`
+  service keys, which exist only for AUTH bypass. Kind 0 `followers` counts
+  are not filtered. Default: empty (no trust filtering; every pubkey
+  counts).
 
 ## Performance Notes
 

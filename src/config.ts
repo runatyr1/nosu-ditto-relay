@@ -73,6 +73,18 @@ export class Config {
    * env var (comma-separated hex pubkeys). Default: empty (no master pubkeys).
    */
   readonly masterPubkeys: Set<string>;
+  /**
+   * Seed pubkeys (hex) for the engagement web of trust. The background
+   * worker expands these 2 follow-hops via kind 3 contact lists; only
+   * pubkeys inside the resulting set count toward `engagers`, the other
+   * engagement scores, and trends. Distinct from `MASTER_PUBKEYS` (infra
+   * service keys for AUTH bypass, with no meaningful follow graphs): seeds
+   * should be real accounts whose follows root the trust graph, e.g. the
+   * operator's personal account. Set via the `WOT_SEED_PUBKEYS` env var
+   * (comma-separated hex pubkeys). Default: empty (trust filtering
+   * disabled — every pubkey counts).
+   */
+  readonly wotSeedPubkeys: Set<string>;
   /** Whether to enable background stats recomputation and NIP-85 publishing. Default: true. */
   readonly statsEnabled: boolean;
   /**
@@ -326,6 +338,26 @@ export class Config {
           return s;
         });
       this.masterPubkeys = new Set(pubkeys);
+    }
+
+    // wotSeedPubkeys
+    const wotSeedPubkeysValue = env.get("WOT_SEED_PUBKEYS");
+    if (!wotSeedPubkeysValue) {
+      this.wotSeedPubkeys = new Set();
+    } else {
+      const pubkeys = wotSeedPubkeysValue
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0)
+        .map((s) => {
+          if (!/^[0-9a-f]{64}$/.test(s)) {
+            throw new Error(
+              `WOT_SEED_PUBKEYS entries must be 64-character hex pubkeys; invalid entry: ${s}`,
+            );
+          }
+          return s;
+        });
+      this.wotSeedPubkeys = new Set(pubkeys);
     }
 
     // statsEnabled
