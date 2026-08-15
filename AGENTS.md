@@ -117,6 +117,9 @@ the hot path.
 ├── package.json       # Dependencies and scripts
 ├── tsconfig.json      # TypeScript configuration
 ├── biome.json         # Biome linter/formatter configuration
+├── Dockerfile         # Container image (Bun runtime, no build step)
+├── docker-compose.yml # Self-host stack: relay + single-node OpenSearch
+├── .dockerignore      # Build context exclusions
 ├── .gitlab-ci.yml     # GitLab CI pipeline (lint, test, typecheck)
 ├── .env.example       # Example environment variables
 ├── .gitignore         # Git ignore rules

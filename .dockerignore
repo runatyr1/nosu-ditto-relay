@@ -1,0 +1,24 @@
+# Installed inside the image; a host node_modules would be the wrong platform.
+node_modules/
+
+# Secrets — the relay is configured through the runtime environment, never
+# through a file baked into the image.
+.env
+.env.*
+
+.git/
+.gitignore
+.gitlab-ci.yml
+.ai/
+
+# Not needed at runtime.
+*.md
+LICENSE
+biome.json
+opencode.json
+src/**/*.test.ts
+
+# Docker's own files.
+Dockerfile
+docker-compose.yml
+.dockerignore

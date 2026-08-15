@@ -259,6 +259,8 @@ All options:
 - OpenSearch 2.x or compatible service
 - Bun runtime
 
+Or just Docker — see [Docker (self-hosting)](#docker-self-hosting) below.
+
 ### Start the relay
 
 ```bash
@@ -267,6 +269,58 @@ bun start
 
 # Development mode with auto-reload
 bun dev
+```
+
+### Docker (self-hosting)
+
+`docker-compose.yml` brings up the relay together with a single-node
+OpenSearch, which is the quickest way to self-host:
+
+```bash
+cp .env.example .env
+# Set at least RELAY_URL and NOSTR_NSEC — the relay refuses to start without them.
+docker compose up -d
+docker compose logs -f relay
+```
+
+The relay is then on `http://localhost:13131` (WebSocket on the same port).
+Compose waits for OpenSearch to report healthy before starting the relay,
+because the relay exits if it cannot reach OpenSearch during its startup
+migration. The index is created automatically on first boot.
+
+Notes:
+
+- **`PORT` and `OPENSEARCH_NODE` from `.env` are ignored** for the container:
+  inside the compose network the relay always listens on 13131 and reaches
+  OpenSearch at `http://opensearch:9200`. To publish a different host port,
+  set `RELAY_PORT` in `.env` — it maps `RELAY_PORT` on the host to 13131 in
+  the container.
+- **OpenSearch has no authentication and is not published** to the host; it
+  is reachable only from the compose network. If you publish port 9200, turn
+  the security plugin back on first.
+- Event data lives in the `opensearch-data` named volume, so it survives
+  `docker compose down`. Use `down -v` to delete it.
+- OpenSearch is capped at a 1 GB heap by default. Raise
+  `OPENSEARCH_JAVA_OPTS` for anything beyond light use, and keep `-Xms` and
+  `-Xmx` equal.
+- If OpenSearch fails to start, check the host's `vm.max_map_count`:
+  `sudo sysctl -w vm.max_map_count=262144` (persist it in
+  `/etc/sysctl.conf`).
+- The relay serves plain HTTP/WS. Terminate TLS at a reverse proxy in front
+  of it and set `IP_HEADER` so client IPs are logged correctly.
+
+To point the image at OpenSearch you already run, skip the bundled service
+and pass your own settings:
+
+```bash
+docker build -t ditto-relay .
+docker run -d -p 13131:13131 --env-file .env ditto-relay
+```
+
+Maintenance scripts ship in the image and can be run against a live stack:
+
+```bash
+docker compose exec relay bun scripts/update-trends.ts
 ```
 
 ### Running in Cluster Mode
