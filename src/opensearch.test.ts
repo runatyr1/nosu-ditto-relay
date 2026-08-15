@@ -8516,9 +8516,25 @@ describe("OpenSearchRelay.recomputeScores", () => {
     const msearchCalls: number[] = [];
 
     const client = {
-      search: async () => ({
-        body: { hits: { hits: opts.dirty.map((d) => ({ _source: d })) } },
-      }),
+      // Honors the Phase 1 `terms: { id }` filter so re-queried subsets
+      // (e.g. the per-tick overflow) resolve to just those events; with no
+      // id filter it returns the full dirty set.
+      // biome-ignore lint/suspicious/noExplicitAny: test mock
+      search: async (req?: { body?: any }) => {
+        const must = req?.body?.query?.bool?.must ?? [];
+        const idClause = Array.isArray(must)
+          ? must.find(
+              (c: Record<string, unknown>) =>
+                "terms" in c &&
+                (c as { terms: Record<string, unknown> }).terms.id,
+            )
+          : undefined;
+        const wanted: string[] | undefined = idClause?.terms?.id;
+        const hits = (
+          wanted ? opts.dirty.filter((d) => wanted.includes(d.id)) : opts.dirty
+        ).map((d) => ({ _source: d }));
+        return { body: { hits: { hits } } };
+      },
       // biome-ignore lint/suspicious/noExplicitAny: test mock
       msearch: async (requests: Array<{ body: any }>) => {
         msearchCalls.push(requests.length);
@@ -8767,6 +8783,32 @@ describe("OpenSearchRelay.recomputeScores", () => {
     // More than one msearch, and no single call exceeded the chunk cap.
     assert.ok(msearchCalls.length > 1, "expected the msearch to be chunked");
     assert.ok(Math.max(...msearchCalls) <= 600);
+  });
+
+  it("caps engagement events per tick and re-queues the overflow", async () => {
+    // 400 dirty events exceeds the 300/tick engagement cap, so one call
+    // must process 300 and leave 100 pending for the next tick — bounding
+    // the work so a large burst can't monopolize the recompute loop.
+    const ids = Array.from({ length: 400 }, (_, i) =>
+      i.toString(16).padStart(64, "0"),
+    );
+    const { client, written } = createScoreMockClient({
+      dirty: ids.map((id) => ({ id, kind: 1, pubkey: "b".repeat(64) })),
+      referencing: [{ kind: 7, pubkey: "c".repeat(64), via: "e" }],
+    });
+
+    const relay = new OpenSearchRelay(client as unknown as Client, {
+      indexName: "test-index",
+    });
+    relay.addDirtyIds(ids);
+
+    const first = await relay.recomputeScores();
+    assert.equal(first.count, 300, "first tick processes the cap");
+    assert.equal(written.length, 300);
+
+    // The 100 overflow events remain dirty and drain on the next tick.
+    const second = await relay.recomputeScores();
+    assert.equal(second.count, 100, "second tick drains the overflow");
   });
 
   it("falls back to unfiltered counting when the provider returns undefined", async () => {

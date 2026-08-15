@@ -148,6 +148,10 @@ export class Trends {
                     terms: {
                       field: "pubkey",
                       size: TRUSTED_AUTHOR_AGG_SIZE,
+                      // Build the term map from matched docs rather than
+                      // global ordinals over every pubkey in the shard —
+                      // pubkey is ultra-high-cardinality.
+                      execution_hint: "map",
                     },
                   },
                 }

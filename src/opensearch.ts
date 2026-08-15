@@ -190,6 +190,18 @@ const TRUSTED_PUBKEY_AGG_SIZE = 3000;
 const RECOMPUTE_MSEARCH_CHUNK = 600;
 
 /**
+ * Maximum non-kind-0 (engagement) events processed by a single
+ * `recomputeScores` call. Each such event costs 6 aggregation sub-queries;
+ * a large dirty burst — the WoT seed re-dirty of thousands of events, or an
+ * engagement flood — would otherwise run them all in one tick, monopolizing
+ * the every-5s loop for minutes (the `recomputeInFlight` guard skips
+ * overlapping ticks) and saturating the OpenSearch search pool. Overflow
+ * stays in the pending dirty set and is picked up by subsequent ticks, so
+ * the work drains steadily instead of in one blocking spike.
+ */
+const MAX_RECOMPUTE_ENGAGEMENT_PER_TICK = 300;
+
+/**
  * A bucket of the per-pubkey `terms` agg used in trusted mode. The
  * optional `total_msats` sub-agg is only present on the zap sub-query.
  */
@@ -3217,6 +3229,17 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       }
     }
 
+    // Cap the expensive (6-sub-query) engagement work per tick; return the
+    // overflow to the pending set so it drains over subsequent ticks rather
+    // than blocking the loop in one spike. See
+    // MAX_RECOMPUTE_ENGAGEMENT_PER_TICK.
+    if (dirtyNonKind0Ids.length > MAX_RECOMPUTE_ENGAGEMENT_PER_TICK) {
+      const overflow = dirtyNonKind0Ids.splice(
+        MAX_RECOMPUTE_ENGAGEMENT_PER_TICK,
+      );
+      this.addDirtyIds(overflow);
+    }
+
     const allDirtyIds = [...dirtyKind0.map((d) => d.id), ...dirtyNonKind0Ids];
 
     if (allDirtyIds.length === 0) {
@@ -3312,6 +3335,14 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
                         terms: {
                           field: "pubkey",
                           size: TRUSTED_PUBKEY_AGG_SIZE,
+                          // Each sub-query matches only the handful of docs
+                          // referencing one target event, so build the term
+                          // map from those docs directly. The default
+                          // (global_ordinals) would build ordinals over every
+                          // pubkey in the shard — catastrophic on this
+                          // ultra-high-cardinality field, and the exact cost
+                          // the count/cardinality design originally avoided.
+                          execution_hint: "map",
                         },
                         ...("agg" in q &&
                           q.agg.into === "zap_amount_msats" && {
