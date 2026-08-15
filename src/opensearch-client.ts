@@ -13,6 +13,18 @@
 
 import { opensearchSearchDurationHistogram } from "./metrics.ts";
 
+/**
+ * Content encodings advertised to OpenSearch.
+ *
+ * Deliberately excludes zstd.  OpenSearch (observed on 2.19.0) offers zstd
+ * and, when a client advertises it, answers with `content-encoding: zstd`
+ * and a `content-length` for the *uncompressed* body — then never sends the
+ * payload, so the request hangs until it times out.  This is server-side:
+ * curl reproduces it too.  Bun's `fetch` advertises zstd by default, so the
+ * encodings have to be pinned here or every request takes the broken path.
+ */
+const ACCEPT_ENCODING = "gzip";
+
 /** Options accepted by the client constructor. */
 export interface ClientOptions {
   /** Base URL of the OpenSearch node, e.g. `http://localhost:9200`. */
@@ -200,7 +212,9 @@ export class Client {
       if (qs) url += `?${qs}`;
     }
 
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = {
+      "Accept-Encoding": ACCEPT_ENCODING,
+    };
     if (this.authHeader) headers.Authorization = this.authHeader;
 
     const init: RequestInit = { method, headers };
@@ -320,6 +334,7 @@ export class Client {
 
     const headers: Record<string, string> = {
       "Content-Type": "application/x-ndjson",
+      "Accept-Encoding": ACCEPT_ENCODING,
     };
     if (this.authHeader) headers.Authorization = this.authHeader;
 
@@ -377,6 +392,7 @@ export class Client {
 
     const headers: Record<string, string> = {
       "Content-Type": "application/x-ndjson",
+      "Accept-Encoding": ACCEPT_ENCODING,
     };
     if (this.authHeader) headers.Authorization = this.authHeader;
 
