@@ -6,6 +6,7 @@ import type { Filter, NostrEvent } from "nostr-tools";
 import { matchFilter, verifyEvent } from "nostr-tools";
 
 import type { AnalyzeResult } from "./analyze.ts";
+import { applyDeletionRequest, applyVanishRequest } from "./deletions.ts";
 import { StorageOverloaded } from "./errors.ts";
 import { clip, errFields, Logger } from "./log.ts";
 import {
@@ -874,75 +875,7 @@ export class Relay {
     // The deletion event itself is still stored below so it remains queryable.
     if (event.kind === 5) {
       try {
-        // Extract e and a tags for deletion
-        const eTagValues = event.tags
-          .filter((tag) => tag[0] === "e" && tag.length >= 2)
-          .map((tag) => tag[1]);
-
-        const aTagFilters: Filter[] = [];
-        for (const tag of event.tags) {
-          if (tag[0] === "a" && tag.length >= 2) {
-            const parts = tag[1].split(":");
-            if (parts.length === 3) {
-              const [kindStr, pubkey, dTag] = parts;
-              const kind = Number.parseInt(kindStr, 10);
-              // NIP-09: Only allow deletion of own events (pubkey must match)
-              if (!Number.isNaN(kind) && pubkey === event.pubkey) {
-                const filter: Filter = {
-                  kinds: [kind],
-                  authors: [pubkey],
-                  // NIP-09: delete all versions up to the deletion request timestamp.
-                  until: event.created_at,
-                };
-                // Only add d-tag filter for addressable events (with non-empty d-tag)
-                if (dTag) {
-                  filter["#d"] = [dTag];
-                }
-                aTagFilters.push(filter);
-              }
-            }
-          }
-        }
-
-        const filters: Filter[] = [];
-
-        // Resolve e-tagged events and authorize each deletion in code. A
-        // single id-keyed query covers both cases: the deleter's own events
-        // (regular NIP-09 deletion) and gift wraps addressed to the deleter.
-        if (eTagValues.length > 0) {
-          // Internal lookup: every e-tagged event must be considered, so the
-          // limit is the id count rather than the client-facing default.
-          const matched = await this.storage.query([
-            { ids: eTagValues, limit: eTagValues.length },
-          ]);
-          const deletableIds = matched
-            .filter((e) => {
-              // NIP-59: A gift wrap (kind 1059) may only be deleted by the
-              // p-tagged recipient — never by its author/signer (which may now
-              // be a deterministic conversation key, see
-              // nostr-protocol/nips#2396) nor by the shared key.
-              if (e.kind === 1059) {
-                return e.tags.some(
-                  (tag) => tag[0] === "p" && tag[1] === event.pubkey,
-                );
-              }
-              // NIP-09: every other kind may only be deleted by its author.
-              return e.pubkey === event.pubkey;
-            })
-            .map((e) => e.id);
-
-          if (deletableIds.length > 0) {
-            filters.push({ ids: deletableIds });
-          }
-        }
-
-        // Add addressable event filters
-        filters.push(...aTagFilters);
-
-        // Remove matching events
-        if (filters.length > 0 && this.storage.remove) {
-          await this.storage.remove(filters);
-        }
+        await applyDeletionRequest(this.storage, event);
       } catch (error) {
         this.log.error("deletion_failed", {
           id: event.id,
@@ -980,31 +913,8 @@ export class Relay {
             url === "ALL_RELAYS" || this.relayUrlMatches(url, this.relayUrl),
         );
 
-        if (isTargeted && this.storage.remove) {
-          // Delete all events from this pubkey up to created_at, except gift
-          // wraps it signed. NIP-59: a gift wrap belongs to its p-tagged
-          // recipient, so its signer can't make the recipient's copy vanish —
-          // the same rule NIP-09 deletions follow above.
-          await this.storage.remove(
-            [
-              {
-                authors: [event.pubkey],
-                until: event.created_at,
-              },
-            ],
-            { excludeKinds: [1059] },
-          );
-
-          // NIP-62: Relays SHOULD delete all NIP-59 Gift Wraps (kind 1059)
-          // that p-tagged the pubkey.
-          await this.storage.remove([
-            {
-              kinds: [1059],
-              "#p": [event.pubkey],
-              until: event.created_at,
-            },
-          ]);
-
+        if (isTargeted) {
+          await applyVanishRequest(this.storage, event);
           this.log.info("vanish_request", { pubkey: event.pubkey });
         }
       } catch (error) {

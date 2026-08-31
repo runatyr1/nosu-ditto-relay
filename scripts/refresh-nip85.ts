@@ -25,61 +25,15 @@ import type { EventScores } from "../src/opensearch.ts";
 import { OpenSearchRelay } from "../src/opensearch.ts";
 import type { ClientOptions } from "../src/opensearch-client.ts";
 import { Client as OpenSearchClient } from "../src/opensearch-client.ts";
+import { withRetry } from "./retry.ts";
 
 const SCROLL_SIZE = 1000;
 const SCROLL_TTL = "5m";
 const BATCH_SIZE = 500;
 
-/** Delay for the given number of milliseconds. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /** Check if a string is a valid 64-char lowercase hex event ID. */
 function isValidEventId(s: string): boolean {
   return /^[0-9a-f]{64}$/.test(s);
-}
-
-/** Run an async function with retries on 429/circuit breaker errors. */
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  opts: {
-    maxRetries?: number;
-    baseDelay?: number;
-    onRetry?: () => Promise<void>;
-  } = {},
-): Promise<T> {
-  const maxRetries = opts.maxRetries ?? 5;
-  const baseDelay = opts.baseDelay ?? 30_000;
-
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      const isRetryable =
-        msg.includes("circuit_breaking") ||
-        msg.includes("429") ||
-        msg.includes("Data too large") ||
-        msg.includes("search_phase_execution_exception") ||
-        msg.includes("too_many_requests");
-
-      if (!isRetryable || attempt >= maxRetries) throw error;
-
-      const delay = baseDelay * 2 ** attempt;
-      console.log(
-        `Circuit breaker hit, waiting ${delay / 1000}s before retry (attempt ${attempt + 1}/${maxRetries})...`,
-      );
-      if (opts.onRetry) {
-        try {
-          await opts.onRetry();
-        } catch (_) {
-          // Ignore
-        }
-      }
-      await sleep(delay);
-    }
-  }
 }
 
 /** Build an OpenSearch query from a Nostr filter (simplified version for scrolling). */

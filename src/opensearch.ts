@@ -291,13 +291,62 @@ export interface RecomputeResult {
   eventScores: Map<string, EventScores>;
 }
 
+/**
+ * The fields replaceable-slot resolution actually reads off an event.
+ *
+ * Narrower than {@link NostrEvent} so a bulk importer can hold one of these
+ * per slot in memory — a 100 GB dump has millions — without carrying the
+ * `content` and `sig` that dominate an event's size and that slot ordering
+ * never looks at.
+ */
+export type SlotEvent = Pick<
+  NostrEvent,
+  "id" | "kind" | "pubkey" | "created_at" | "tags"
+>;
+
+/**
+ * The only thing replaceable-slot resolution reads about a pending write:
+ * the event itself. Declared separately from {@link BulkEntry} so the bulk
+ * importer can reconcile slots without building throwaway documents for
+ * events it has already written.
+ */
+interface SlotCandidate {
+  event: SlotEvent;
+}
+
 /** Pending bulk operation for an event. */
-interface BulkEntry {
+interface BulkEntry extends SlotCandidate {
+  /** Narrowed: a pending write always has the whole event, slots don't. */
   event: NostrEvent;
   doc: NostrEventDocument;
   docId: string;
   resolve: () => void;
   reject: (error: Error) => void;
+}
+
+/** How many distinct bulk errors {@link OpenSearchRelay.importEvents} keeps. */
+const IMPORT_ERROR_SAMPLE_SIZE = 5;
+
+/** Bulk item statuses worth retrying: the cluster is busy, not the data bad. */
+const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
+
+/** Outcome of one {@link OpenSearchRelay.importEvents} batch. */
+export interface ImportResult {
+  /** Events written to the index by this batch. */
+  created: number;
+  /** Events left alone because their id was already indexed. */
+  skipped: number;
+  /** Events OpenSearch rejected for a reason retrying won't fix. */
+  failed: number;
+  /**
+   * Events rejected because the cluster pushed back (429/503 and friends).
+   * Nothing is wrong with them and nothing was written, so the caller should
+   * retry them rather than count them lost. Retrying is safe: `create` makes
+   * the whole import idempotent.
+   */
+  retryable: NostrEvent[];
+  /** Up to {@link IMPORT_ERROR_SAMPLE_SIZE} representative failures. */
+  errors: string[];
 }
 
 /**
@@ -2057,6 +2106,291 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
   }
 
   /**
+   * Bulk-import historical events without disturbing documents already in
+   * the index.
+   *
+   * Unlike {@link event}, which indexes unconditionally, this issues bulk
+   * `create` operations, so an event whose id is already stored is left
+   * exactly as it is. That distinction is the whole point:
+   * {@link eventToDocument} rebuilds a document from the event alone, which
+   * means it always carries `deleted: false`, `replaced: false` and zeroed
+   * score fields. Overwriting a live document with one would discard its
+   * accumulated engagement counts and resurrect anything that had been
+   * soft-deleted. Importing is therefore idempotent, and safe to re-run
+   * over a dump that overlaps data the relay already holds.
+   *
+   * Slot reconciliation for replaceable and addressable kinds is deferred
+   * unless `resolveSlots` is set. A bulk import touches the same slot many
+   * times (every historical version of a profile is its own event), so a
+   * caller streaming a large dump should collect the affected events, keep
+   * the newest per slot, and make one {@link resolveSlotsFor} call at the
+   * end rather than paying for an msearch per batch.
+   *
+   * Deletion requests are stored like any other event but are NOT applied:
+   * honoring kind 5 and kind 62 is protocol-layer work (see
+   * `applyDeletionRequest` in `deletions.ts`), and a caller importing a dump
+   * has to apply them in its own pass.
+   */
+  async importEvents(
+    events: NostrEvent[],
+    opts?: { resolveSlots?: boolean },
+  ): Promise<ImportResult> {
+    if (events.length === 0) {
+      return { created: 0, skipped: 0, failed: 0, retryable: [], errors: [] };
+    }
+
+    // Documents are built straight into the request body and never kept
+    // alongside it. Holding them — as a parallel array of entries, say —
+    // keeps several MB per batch alive across the `await` below, which is
+    // long enough for a bulk import to promote all of it out of the nursery
+    // and into a generation JavaScriptCore collects far more lazily. That
+    // alone grew the importer past 8 GB RSS at ~25k events/s while the same
+    // run against already-indexed events, where nothing was retained, held
+    // flat at 0.3 GB.
+    const body: Array<Record<string, unknown>> = [];
+    for (const event of events) {
+      body.push({
+        create: { _index: this.indexName, _id: this.getDocumentId(event) },
+      });
+      body.push(
+        this.eventToDocument(event) as unknown as Record<string, unknown>,
+      );
+    }
+
+    const flushEnd = opensearchFlushDurationHistogram.startTimer();
+    let response: Awaited<ReturnType<Client["bulk"]>>;
+    try {
+      response = await this.writeClient.bulk({ body });
+    } finally {
+      flushEnd();
+      // The client has serialised the body; drop the documents now rather
+      // than at the end of the call.
+      body.length = 0;
+    }
+
+    const result: ImportResult = {
+      created: 0,
+      skipped: 0,
+      failed: 0,
+      retryable: [],
+      errors: [],
+    };
+
+    // Only events actually written can change a slot's outcome; a skipped
+    // duplicate leaves the index exactly as the last pass left it. Collected
+    // only when the caller asked for slot resolution — a streaming import
+    // defers it to a later pass and would otherwise retain the batch here.
+    const createdEvents: NostrEvent[] | null = opts?.resolveSlots ? [] : null;
+
+    const items = (response.body.items ?? []) as Array<
+      Record<string, { status?: number; error?: unknown } | undefined>
+    >;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]?.create;
+      if (!item?.error) {
+        result.created++;
+        createdEvents?.push(events[i]);
+        opensearchEventsCounter.inc({ kind: events[i].kind });
+      } else if (item.status === 409) {
+        // version_conflict_engine_exception: this id is already indexed.
+        // The stored document wins — see the note on score fields above.
+        result.skipped++;
+      } else if (RETRYABLE_STATUSES.has(item.status ?? 0)) {
+        result.retryable.push(events[i]);
+      } else {
+        result.failed++;
+        if (result.errors.length < IMPORT_ERROR_SAMPLE_SIZE) {
+          result.errors.push(clip(JSON.stringify(item.error), 500));
+        }
+      }
+    }
+
+    if (createdEvents !== null && createdEvents.length > 0) {
+      await this.resolveSlotsFor(createdEvents);
+    }
+
+    return result;
+  }
+
+  /**
+   * Resolve a batch of filters to the ids they match, in one msearch.
+   *
+   * The bulk importer's deletion pass needs this. A NIP-09 `a` tag names a
+   * coordinate rather than an id, and {@link remove} answers one filter with
+   * one `updateByQuery` — fine for a single live deletion request, hopeless
+   * for the 2.7M distinct coordinates in a dump, which at any achievable
+   * rate is days of work. Resolving them to ids a hundred filters at a time
+   * and handing those to {@link markDeletedByIds} turns it into thousands of
+   * round trips instead of millions.
+   *
+   * Visibility matches {@link remove}: replaced history, auth-protected
+   * kinds and expired-but-stored events are all in scope, because a
+   * deletion request reaches things a REQ would not show.
+   *
+   * `size` caps the ids returned per filter. A coordinate with more stored
+   * versions than that keeps its oldest ones, which the next pass over the
+   * same coordinate would pick up.
+   */
+  async queryIdsBatch(
+    filters: NostrFilter[],
+    opts?: { size?: number },
+  ): Promise<string[][]> {
+    if (filters.length === 0) return [];
+
+    const size = opts?.size ?? 100;
+    const requests = filters.map((filter) => ({
+      index: this.indexName,
+      body: {
+        query: this.buildQuery(filter, {
+          includeReplaced: true,
+          includeAuthKinds: true,
+          includeExpired: true,
+        }),
+        size,
+        _source: ["id"],
+      },
+    }));
+
+    opensearchQueriesCounter.inc({ type: "import_id_resolution" });
+    const response = await this.client.msearch(requests);
+    const responses =
+      (
+        response.body as {
+          responses?: Array<{
+            hits?: { hits?: Array<{ _source?: { id: string } }> };
+          }>;
+        }
+      ).responses ?? [];
+
+    return filters.map((_, i) =>
+      (responses[i]?.hits?.hits ?? [])
+        .map((hit) => hit._source?.id)
+        .filter((id): id is string => typeof id === "string"),
+    );
+  }
+
+  /**
+   * Make everything written so far searchable.
+   *
+   * Ingest writes with `refresh: false` and lets the index's own
+   * `refresh_interval` catch up, which is right for the live path but leaves
+   * a bulk importer unable to see what it just wrote. The import phases that
+   * read back — slot resolution and deletion replay — call this first so
+   * they aren't reasoning about a stale view.
+   *
+   * Cheap relative to what follows, but not free: don't call it per batch.
+   */
+  async refreshIndex(): Promise<void> {
+    await this.writeClient.indices.refresh({ index: this.indexName });
+  }
+
+  /**
+   * Apply partial-document updates by id in a single bulk request, returning
+   * how many documents were updated.
+   *
+   * The counterpart to {@link queryIdsBatch} for maintenance scripts that
+   * would otherwise reach for `updateByQuery`. That endpoint is a poor fit
+   * for them twice over: it re-runs the query server-side when the caller
+   * has already resolved exactly which documents it means, and under Bun its
+   * long-running requests fail with `Malformed_HTTP_Response` often enough
+   * to sink an hours-long backfill — where `bulk` carried 95M documents
+   * through the same client without a single transport failure.
+   *
+   * Ids that don't exist are ignored, so callers may pass stale targets.
+   */
+  async bulkUpdateDocs(
+    updates: Array<{ id: string; doc: Record<string, unknown> }>,
+  ): Promise<number> {
+    if (updates.length === 0) return 0;
+
+    const body: Array<Record<string, unknown>> = [];
+    for (const update of updates) {
+      body.push({ update: { _index: this.indexName, _id: update.id } });
+      body.push({ doc: update.doc });
+    }
+
+    const response = await this.writeClient.bulk({ body });
+
+    const items = (response.body.items ?? []) as Array<
+      Record<string, { error?: unknown } | undefined>
+    >;
+
+    let updated = 0;
+    for (const item of items) {
+      if (!item.update?.error) updated++;
+    }
+    return updated;
+  }
+
+  /**
+   * Soft-delete documents by id in a single bulk request, returning how many
+   * were updated.
+   *
+   * This is the deletion primitive the bulk importer needs. {@link remove}
+   * takes filters, builds a query and runs an `updateByQuery` with an
+   * immediate refresh, which is the right shape for one live deletion
+   * request but ruinous when replaying millions of historical ones. A caller
+   * that has already resolved and authorized its targets — see `canDelete`
+   * in `deletions.ts` — knows the exact ids and can mark a whole batch with
+   * one bulk update and no forced refresh.
+   *
+   * Ids that don't exist in the index are silently ignored, so callers may
+   * pass targets that were never stored here.
+   *
+   * This method does NOT authorize anything. Never hand it ids that haven't
+   * been checked against the deletion request's author.
+   */
+  async markDeletedByIds(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+
+    const body: Array<Record<string, unknown>> = [];
+    for (const id of ids) {
+      body.push({ update: { _index: this.indexName, _id: id } });
+      body.push({ doc: { deleted: true } });
+    }
+
+    const response = await this.writeClient.bulk({ body });
+
+    const items = (response.body.items ?? []) as Array<
+      Record<string, { status?: number; error?: unknown } | undefined>
+    >;
+
+    let updated = 0;
+    for (const item of items) {
+      const result = item.update;
+      // 404 is expected and uninteresting: the dump referenced an event this
+      // relay never stored.
+      if (!result?.error) updated++;
+    }
+
+    return updated;
+  }
+
+  /**
+   * Reconcile replaceable/addressable slots for events that are already in
+   * the index, marking every version but the NIP-01 winner `replaced: true`.
+   *
+   * This is the deferred half of {@link importEvents}. Running it after
+   * ingest — once the index has been refreshed and every imported version is
+   * searchable — is what lets a bulk import of historical data converge on
+   * one live version per slot. Events of non-replaceable kinds are ignored,
+   * so a caller can pass a batch unfiltered.
+   */
+  async resolveSlotsFor(events: SlotEvent[]): Promise<void> {
+    const entries: SlotCandidate[] = events
+      .filter(
+        (event) =>
+          NKinds.replaceable(event.kind) || NKinds.addressable(event.kind),
+      )
+      .map((event) => ({ event }));
+
+    if (entries.length === 0) return;
+
+    await this.resolveReplaceableSlots(entries);
+  }
+
+  /**
    * Phase 2 of flush: for replaceable/addressable events, find the slot
    * winner and mark all losers as `replaced: true` (or delete them for
    * excluded kinds).  Runs asynchronously so it doesn't block the main
@@ -2091,7 +2425,9 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
    * deep-history fallback ensures the next replacement event for an
    * affected slot still picks up any stragglers.
    */
-  private async resolveReplaceableSlots(entries: BulkEntry[]): Promise<void> {
+  private async resolveReplaceableSlots(
+    entries: SlotCandidate[],
+  ): Promise<void> {
     const acquired = await this.acquirePhase2Slot();
     if (!acquired) {
       opensearchPhase2DroppedCounter.inc();
@@ -2108,7 +2444,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
   }
 
   private async resolveReplaceableSlotsInner(
-    entries: BulkEntry[],
+    entries: SlotCandidate[],
   ): Promise<void> {
     type Slot = {
       kind: number;

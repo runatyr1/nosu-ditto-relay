@@ -115,6 +115,15 @@ class IndicesApi {
     return { body: await res.json() };
   }
 
+  /** POST /{index}/_refresh */
+  async refresh(params: { index: string }): Promise<ApiResponse<unknown>> {
+    const res = await this._request(
+      "POST",
+      `/${encodeURIComponent(params.index)}/_refresh`,
+    );
+    return { body: await res.json() };
+  }
+
   /** POST /{index}/_cache/clear */
   async clearCache(params: {
     index: string;

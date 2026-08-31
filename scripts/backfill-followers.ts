@@ -17,55 +17,34 @@ import { Config } from "../src/config.ts";
 import { OpenSearchRelay } from "../src/opensearch.ts";
 import type { ClientOptions } from "../src/opensearch-client.ts";
 import { Client as OpenSearchClient } from "../src/opensearch-client.ts";
+import { sleep, withRetry } from "./retry.ts";
 
-const BATCH_SIZE = 5000;
+/**
+ * Followed pubkeys per aggregation page, and so per `updateByQuery`.
+ *
+ * Each batch sends a `terms` clause and a painless params map of this size
+ * and updates every matching kind 0. Larger batches mean fewer, longer
+ * requests, and long requests against a 300M-document index are where Bun's
+ * fetch starts returning `Malformed_HTTP_Response`. Override with
+ * `--batch <n>` if a run keeps stalling on the same page.
+ */
+/**
+ * Kind 0 versions updated per pubkey. A profile's replaced history is
+ * counted too, so the field stays consistent if an older version is ever
+ * surfaced; a pubkey with more versions than this keeps its oldest ones.
+ */
+const KIND0_VERSION_CAP = 100;
 
-/** Delay for the given number of milliseconds. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Run an async function with retries on 429/circuit breaker errors. */
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  opts: {
-    maxRetries?: number;
-    baseDelay?: number;
-    onRetry?: () => Promise<void>;
-  } = {},
-): Promise<T> {
-  const maxRetries = opts.maxRetries ?? 5;
-  const baseDelay = opts.baseDelay ?? 30_000;
-
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      const isRetryable =
-        msg.includes("circuit_breaking") ||
-        msg.includes("429") ||
-        msg.includes("Data too large") ||
-        msg.includes("search_phase_execution_exception") ||
-        msg.includes("too_many_requests");
-
-      if (!isRetryable || attempt >= maxRetries) throw error;
-
-      const delay = baseDelay * 2 ** attempt;
-      console.log(
-        `Circuit breaker hit, waiting ${delay / 1000}s before retry (attempt ${attempt + 1}/${maxRetries})...`,
-      );
-      if (opts.onRetry) {
-        try {
-          await opts.onRetry();
-        } catch (_) {
-          // Ignore
-        }
-      }
-      await sleep(delay);
-    }
+const BATCH_SIZE = (() => {
+  const i = process.argv.indexOf("--batch");
+  if (i === -1) return 5000;
+  const value = Number(process.argv[i + 1]);
+  if (!Number.isInteger(value) || value <= 0) {
+    console.error(`Invalid --batch: ${process.argv[i + 1]}`);
+    process.exit(1);
   }
-}
+  return value;
+})();
 
 async function main() {
   console.log("Starting follower count backfill\n");
@@ -162,40 +141,38 @@ async function main() {
       followerCounts.set(pubkey, bucket.doc_count);
     }
 
-    // Update kind 0 events for these pubkeys using update_by_query.
-    // This matches by pubkey field rather than doc ID for efficiency.
+    // Resolve each pubkey's kind 0 documents, then set the count on them by
+    // id. The obvious implementation is one updateByQuery matching
+    // kind 0 AND terms(pubkeys), but under Bun those long requests fail with
+    // Malformed_HTTP_Response and, once a pooled connection goes bad, every
+    // retry on it fails too — repeatedly killing this backfill hundreds of
+    // thousands of pubkeys in, with nothing resumable behind it. Resolving
+    // ids and issuing a bulk update is the path the event import drove 95M
+    // documents through without a single transport failure.
     const pubkeys = [...followerCounts.keys()];
-    const countParams: Record<string, number> = {};
-    for (const [pk, count] of followerCounts) {
-      countParams[pk] = count;
-    }
 
-    await withRetry(
+    const idsPerPubkey = await withRetry(
       () =>
-        client.updateByQuery({
-          index: indexName,
-          body: {
-            query: {
-              bool: {
-                must: [{ term: { kind: 0 } }, { terms: { pubkey: pubkeys } }],
-              },
-            },
-            script: {
-              source: `
-                def count = params.counts.get(ctx._source.pubkey);
-                if (count != null) {
-                  ctx._source.followers = count;
-                }
-              `,
-              lang: "painless",
-              params: { counts: countParams },
-            },
-          },
-          refresh: false,
-          conflicts: "proceed",
-        }),
+        relay.queryIdsBatch(
+          pubkeys.map((pubkey) => ({ kinds: [0], authors: [pubkey] })),
+          { size: KIND0_VERSION_CAP },
+        ),
       { onRetry: clearCache },
     );
+
+    const updates: Array<{ id: string; doc: Record<string, unknown> }> = [];
+    for (let i = 0; i < pubkeys.length; i++) {
+      const followers = followerCounts.get(pubkeys[i]) ?? 0;
+      for (const id of idsPerPubkey[i] ?? []) {
+        updates.push({ id, doc: { followers } });
+      }
+    }
+
+    if (updates.length > 0) {
+      await withRetry(() => relay.bulkUpdateDocs(updates), {
+        onRetry: clearCache,
+      });
+    }
 
     totalProcessed += buckets.length;
     totalUpdated += followerCounts.size;

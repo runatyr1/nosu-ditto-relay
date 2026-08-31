@@ -303,6 +303,7 @@ describe("OpenSearchRelay", () => {
           for (let i = 0; i < body.length; i++) {
             const action = body[i] as {
               index?: { _id: string };
+              create?: { _id: string };
               update?: { _id: string };
               delete?: { _id: string };
             };
@@ -320,6 +321,21 @@ describe("OpenSearchRelay", () => {
               documents.set(action.index._id, payload);
               if (deferVisibility) unsearchable.add(action.index._id);
               items.push({ index: {} });
+            } else if (action.create) {
+              // `create` refuses to overwrite: OpenSearch answers an
+              // existing id with 409 version_conflict_engine_exception.
+              if (documents.has(action.create._id)) {
+                items.push({
+                  create: {
+                    status: 409,
+                    error: { type: "version_conflict_engine_exception" },
+                  },
+                });
+              } else {
+                documents.set(action.create._id, payload);
+                if (deferVisibility) unsearchable.add(action.create._id);
+                items.push({ create: { status: 201 } });
+              }
             } else if (action.update) {
               if (payload.doc) {
                 const existing = documents.get(action.update._id);
@@ -8493,6 +8509,298 @@ describe("OpenSearchRelay", () => {
             true,
         ),
       );
+    });
+  });
+
+  describe("importEvents", () => {
+    it("writes events that are not already indexed", async () => {
+      const { client, documents } = createHistoryMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+      const events = [0, 1, 2].map((i) =>
+        finalizeEvent(
+          { kind: 1, created_at: now - i, tags: [], content: `note ${i}` },
+          sk,
+        ),
+      );
+
+      const result = await relay.importEvents(events);
+
+      assert.equal(result.created, 3);
+      assert.equal(result.skipped, 0);
+      assert.equal(result.failed, 0);
+      assert.equal(documents.size, 3);
+      for (const event of events) {
+        assert.ok(documents.has(event.id), `${event.id} should be indexed`);
+      }
+    });
+
+    it("uses create ops, not index ops", async () => {
+      // The distinction is the entire safety property of the importer, so
+      // assert on the wire format rather than trusting the mock's behavior.
+      const actions: string[] = [];
+      const client = {
+        bulk: async ({ body }: { body: unknown[] }) => {
+          for (let i = 0; i < body.length; i += 2) {
+            actions.push(Object.keys(body[i] as object)[0]);
+          }
+          return {
+            body: {
+              errors: false,
+              items: actions.map(() => ({ create: { status: 201 } })),
+            },
+          };
+        },
+      };
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+      });
+
+      const sk = generateSecretKey();
+      await relay.importEvents([
+        finalizeEvent(
+          {
+            kind: 1,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [],
+            content: "hi",
+          },
+          sk,
+        ),
+      ]);
+
+      assert.deepEqual(actions, ["create"]);
+    });
+
+    it("skips events already indexed, preserving scores and deleted flag", async () => {
+      const { client, documents } = createHistoryMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [],
+          content: "already here",
+        },
+        sk,
+      );
+
+      await relay.event(event);
+
+      // Simulate the state a live document accumulates: engagement counts
+      // from the background worker, and a NIP-09 soft delete.
+      const stored = documents.get(event.id) as Record<string, unknown>;
+      stored.reaction_cnt = 42;
+      stored.zap_amount_msats = 21000;
+      stored.deleted = true;
+
+      const result = await relay.importEvents([event]);
+
+      assert.equal(result.created, 0);
+      assert.equal(result.skipped, 1);
+      assert.equal(result.failed, 0);
+
+      const after = documents.get(event.id) as Record<string, unknown>;
+      assert.equal(after.reaction_cnt, 42, "scores must survive re-import");
+      assert.equal(after.zap_amount_msats, 21000);
+      assert.equal(
+        after.deleted,
+        true,
+        "a re-imported event must not be resurrected",
+      );
+    });
+
+    it("counts failures and samples their errors", async () => {
+      const client = {
+        bulk: async () => ({
+          body: {
+            errors: true,
+            items: [
+              { create: { status: 201 } },
+              {
+                create: {
+                  status: 400,
+                  error: { type: "mapper_parsing_exception" },
+                },
+              },
+              {
+                create: {
+                  status: 409,
+                  error: { type: "version_conflict_engine_exception" },
+                },
+              },
+            ],
+          },
+        }),
+      };
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+      const events = [0, 1, 2].map((i) =>
+        finalizeEvent(
+          { kind: 1, created_at: now - i, tags: [], content: `n${i}` },
+          sk,
+        ),
+      );
+
+      const result = await relay.importEvents(events);
+
+      assert.equal(result.created, 1);
+      assert.equal(result.failed, 1);
+      assert.equal(result.skipped, 1);
+      assert.equal(result.errors.length, 1);
+      assert.ok(result.errors[0].includes("mapper_parsing_exception"));
+    });
+
+    it("separates transient rejections from permanent failures", async () => {
+      // A busy cluster 429s under load. Those events were not written and
+      // nothing is wrong with them, so they must come back for a retry
+      // rather than be counted lost.
+      const client = {
+        bulk: async () => ({
+          body: {
+            errors: true,
+            items: [
+              {
+                create: {
+                  status: 429,
+                  error: { type: "es_rejected_execution_exception" },
+                },
+              },
+              {
+                create: {
+                  status: 400,
+                  error: { type: "mapper_parsing_exception" },
+                },
+              },
+              { create: { status: 201 } },
+            ],
+          },
+        }),
+      };
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+      const events = [0, 1, 2].map((i) =>
+        finalizeEvent(
+          { kind: 1, created_at: now - i, tags: [], content: `n${i}` },
+          sk,
+        ),
+      );
+
+      const result = await relay.importEvents(events);
+
+      assert.equal(result.created, 1);
+      assert.equal(result.failed, 1, "only the mapping error is permanent");
+      assert.deepEqual(
+        result.retryable.map((e) => e.id),
+        [events[0].id],
+      );
+    });
+
+    it("is a no-op for an empty batch", async () => {
+      const relay = new OpenSearchRelay(
+        {
+          bulk: async () => assert.fail("should not issue a bulk request"),
+        } as unknown as Client,
+        { indexName: "test-index" },
+      );
+
+      assert.deepEqual(await relay.importEvents([]), {
+        created: 0,
+        skipped: 0,
+        failed: 0,
+        retryable: [],
+        errors: [],
+      });
+    });
+  });
+
+  describe("resolveSlotsFor", () => {
+    it("marks an imported older version replaced, leaving the newer one live", async () => {
+      // The case that matters when backfilling history into a live relay:
+      // the dump's profile is older than the one the relay already serves,
+      // so importing it must not displace the current version.
+      const { client, documents, refresh } = createHistoryMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      const current = finalizeEvent(
+        {
+          kind: 0,
+          created_at: now,
+          tags: [],
+          content: JSON.stringify({ name: "Current" }),
+        },
+        sk,
+      );
+      await relay.event(current);
+
+      const historical = finalizeEvent(
+        {
+          kind: 0,
+          created_at: now - 5000,
+          tags: [],
+          content: JSON.stringify({ name: "Historical" }),
+        },
+        sk,
+      );
+
+      const result = await relay.importEvents([historical]);
+      assert.equal(result.created, 1);
+
+      refresh();
+      await relay.resolveSlotsFor([historical]);
+
+      const oldDoc = documents.get(historical.id) as { replaced?: boolean };
+      const newDoc = documents.get(current.id) as { replaced?: boolean };
+
+      assert.equal(oldDoc.replaced, true, "imported old version loses");
+      assert.ok(!newDoc.replaced, "the newer version stays live");
+    });
+
+    it("ignores non-replaceable kinds", async () => {
+      const relay = new OpenSearchRelay(
+        {
+          msearch: async () => assert.fail("should not run slot resolution"),
+        } as unknown as Client,
+        { indexName: "test-index" },
+      );
+
+      const sk = generateSecretKey();
+      await relay.resolveSlotsFor([
+        finalizeEvent(
+          {
+            kind: 1,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [],
+            content: "regular",
+          },
+          sk,
+        ),
+      ]);
     });
   });
 });

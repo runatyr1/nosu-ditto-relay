@@ -13,64 +13,58 @@
  *   bun run scripts/backfill-scores.ts
  */
 
+import {
+  existsSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import process from "node:process";
 import { Config } from "../src/config.ts";
 import { OpenSearchRelay } from "../src/opensearch.ts";
 import type { ClientOptions } from "../src/opensearch-client.ts";
 import { Client as OpenSearchClient } from "../src/opensearch-client.ts";
+import { withRetry } from "./retry.ts";
 
 const BATCH_SIZE = 10000;
 
-/** Delay for the given number of milliseconds. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Where the composite cursor is parked between pages. */
+const CHECKPOINT_PATH =
+  process.env.BACKFILL_SCORES_CHECKPOINT ??
+  "/tmp/backfill-scores.checkpoint.json";
+
+interface ScoresCheckpoint {
+  afterKey: Record<string, string>;
+  processed: number;
+}
+
+/** Read the cursor from a previous run, or null to start from the top. */
+function loadCheckpoint(path: string): ScoresCheckpoint | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as ScoresCheckpoint;
+    return parsed.afterKey ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Park the cursor, atomically so a crash can't leave it truncated. */
+function saveCheckpoint(path: string, checkpoint: ScoresCheckpoint): void {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(checkpoint));
+  renameSync(tmp, path);
+}
+
+/** Drop the cursor once the pass has finished. */
+function clearCheckpoint(path: string): void {
+  rmSync(path, { force: true });
 }
 
 /** Check if a string is a valid 64-char lowercase hex event ID. */
 function isValidEventId(s: string): boolean {
   return /^[0-9a-f]{64}$/.test(s);
-}
-
-/** Run an async function with retries on 429/circuit breaker errors. */
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  opts: {
-    maxRetries?: number;
-    baseDelay?: number;
-    onRetry?: () => Promise<void>;
-  } = {},
-): Promise<T> {
-  const maxRetries = opts.maxRetries ?? 5;
-  const baseDelay = opts.baseDelay ?? 30_000;
-
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      const isRetryable =
-        msg.includes("circuit_breaking") ||
-        msg.includes("429") ||
-        msg.includes("Data too large") ||
-        msg.includes("search_phase_execution_exception") ||
-        msg.includes("too_many_requests");
-
-      if (!isRetryable || attempt >= maxRetries) throw error;
-
-      const delay = baseDelay * 2 ** attempt;
-      console.log(
-        `Circuit breaker hit, waiting ${delay / 1000}s before retry (attempt ${attempt + 1}/${maxRetries})...`,
-      );
-      if (opts.onRetry) {
-        try {
-          await opts.onRetry();
-        } catch (_) {
-          // Ignore
-        }
-      }
-      await sleep(delay);
-    }
-  }
 }
 
 interface ScoreEntry {
@@ -123,8 +117,17 @@ async function main() {
   // and breaks down by kind.
   console.log("Computing scores...\n");
 
-  let totalProcessed = 0;
-  let afterKey: Record<string, string> | undefined;
+  // A full pass is ~96M referenced events and takes days, so the composite
+  // cursor is checkpointed after every page. Without it any failure — the
+  // relay restarting, a broken connection outliving its retries — throws the
+  // whole run away and starts from the first bucket again.
+  const checkpoint = loadCheckpoint(CHECKPOINT_PATH);
+  let totalProcessed = checkpoint?.processed ?? 0;
+  let afterKey: Record<string, string> | undefined = checkpoint?.afterKey;
+
+  if (checkpoint) {
+    console.log(`Resuming after ${totalProcessed} events\n`);
+  }
 
   while (true) {
     const compositeAgg: Record<string, unknown> = {
@@ -358,12 +361,15 @@ async function main() {
 
     if (!afterKey) break;
 
+    saveCheckpoint(CHECKPOINT_PATH, { afterKey, processed: totalProcessed });
+
     // Periodically clear fielddata cache to prevent circuit breaker.
     if (totalProcessed % 50_000 === 0) {
       await clearCache();
     }
   }
 
+  clearCheckpoint(CHECKPOINT_PATH);
   console.log(`\nBackfill complete: ${totalProcessed} events processed`);
 
   await relay.close();
