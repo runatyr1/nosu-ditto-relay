@@ -72,6 +72,28 @@ nak_signer() {
   [ -n "${NCONTAINER_CONNECT_AS:-}" ] && printf '%s\0' --connect-as "$NCONTAINER_CONNECT_AS"
 }
 
+# nak talks to a NIP-46 bunker and to relays/Blossom, none of which has an
+# internal deadline: a stalled peer makes nak wait FOREVER. That matters here
+# because act does not enforce a job's timeout-minutes, so an unbounded nak sits
+# until the coordinator's hour-long ceiling — which replaces every finished
+# job's result with one synthetic "timed out" entry, losing their logs. Bound
+# every nak call so a stuck bunker or relay fails in minutes, named. Overridable
+# for a slow link.
+NAK_SIGN_TIMEOUT="${NAK_SIGN_TIMEOUT:-90}"       # bunker round-trips (verify + event)
+NAK_UPLOAD_TIMEOUT="${NAK_UPLOAD_TIMEOUT:-600}"  # blossom layer uploads, per server
+
+# Run a command under a wall-clock deadline; a timeout (124, or 137 after the
+# follow-up KILL) becomes a named failure rather than a bare non-zero exit.
+bounded() {
+  local secs="$1" what="$2"; shift 2
+  local rc=0
+  timeout --signal=TERM --kill-after=15 "$secs" "$@" || rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    die "$what did not finish within ${secs}s and was killed — the bunker or a relay is not responding (check NCONTAINER_SIGNER / PUBLISH_RELAYS / BLOSSOM_SERVERS)."
+  fi
+  return "$rc"
+}
+
 # ── Preconditions ────────────────────────────────────────────────────────────
 command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
 docker buildx version >/dev/null 2>&1 || die "docker buildx not available"
@@ -103,7 +125,12 @@ if [ "$DRY_RUN" -ne 1 ]; then
   if [ -z "$signer_hex" ]; then
     say "verifying bunker identity (one ephemeral signature, not published)"
     mapfile -d '' -t signer < <(nak_signer)
-    signer_hex="$(nak event -k 0 -c '' "${signer[@]}" 2>/dev/null \
+    # Bounded: a bunker that never answers would otherwise hang here forever
+    # (act does not enforce the job timeout). On timeout `bounded` dies with a
+    # named message; an empty result also trips the guard below.
+    ephemeral_event="$(bounded "$NAK_SIGN_TIMEOUT" "bunker identity check" \
+      nak event -k 0 -c '' "${signer[@]}" 2>/dev/null || true)"
+    signer_hex="$(printf '%s' "$ephemeral_event" \
       | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).pubkey||"")}catch{}})' || true)"
     [ -n "$signer_hex" ] || die "could not reach the bunker to verify its identity (NCONTAINER_SIGNER / NCONTAINER_CONNECT_AS)"
   fi
@@ -151,7 +178,8 @@ for server in "${servers[@]}"; do
   [ -n "$server" ] || continue
   say "upload $IMAGE_NAME blobs -> $server"
   mapfile -d '' -t signer < <(nak_signer)
-  nak blossom -s "$server" "${signer[@]}" upload "$LAYOUT"/blobs/sha256/* >/dev/null
+  bounded "$NAK_UPLOAD_TIMEOUT" "blossom upload to $server" \
+    nak blossom -s "$server" "${signer[@]}" upload "$LAYOUT"/blobs/sha256/* >/dev/null
 done
 
 # ── Sign + publish the kind-30624 repository event ───────────────────────────
@@ -168,7 +196,8 @@ done
 say "sign $IMAGE_NAME repository event -> $PUBLISH_RELAYS"
 IFS=',' read -ra relays <<< "$PUBLISH_RELAYS"
 mapfile -d '' -t signer < <(nak_signer)
-nak event -k 30624 "${evt_tags[@]}" -c '' "${signer[@]}" "${relays[@]}" >/dev/null
+bounded "$NAK_SIGN_TIMEOUT" "publish repository event" \
+  nak event -k 30624 "${evt_tags[@]}" -c '' "${signer[@]}" "${relays[@]}" >/dev/null
 
 printf '\033[32m    ncontainer.io/%s/%s:latest\033[0m\n' "$NCONTAINER_NPUB" "$IMAGE_NAME"
 say "done"
