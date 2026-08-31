@@ -8288,6 +8288,68 @@ describe("OpenSearchRelay", () => {
     });
   });
 
+  describe("NIP-40 expiration cutoff", () => {
+    /** Issue a query at a fixed wall clock and return the cutoff sent. */
+    const cutoffAt = async (nowMs: number): Promise<string> => {
+      let capturedBody: Record<string, unknown> | undefined;
+      const mockClient = {
+        search: async ({ body }: { body: Record<string, unknown> }) => {
+          capturedBody = body;
+          return { body: { hits: { hits: [], total: { value: 0 } } } };
+        },
+      } as unknown as Client;
+
+      const relay = new OpenSearchRelay(mockClient);
+
+      const realNow = Date.now;
+      Date.now = () => nowMs;
+      try {
+        await relay.query([{ kinds: [1] }]);
+      } finally {
+        Date.now = realNow;
+      }
+
+      const boolQuery = (
+        (capturedBody as Record<string, unknown>).query as Record<
+          string,
+          unknown
+        >
+      ).bool as Record<string, unknown>;
+      const mustNot = boolQuery.must_not as Array<Record<string, unknown>>;
+      const expiration = mustNot.find(
+        (c) =>
+          (c.range as Record<string, unknown>)?.["tags_map.expiration"] !==
+          undefined,
+      );
+      assert.ok(expiration, "every query should exclude expired events");
+      const range = (expiration.range as Record<string, { lte: string }>)[
+        "tags_map.expiration"
+      ];
+      return range.lte;
+    };
+
+    it("rounds the cutoff down to a whole bucket", async () => {
+      const lte = await cutoffAt(1_788_198_037_000);
+      assert.equal(Number(lte) % 60, 0);
+      assert.equal(lte, "1788198000");
+    });
+
+    it("never excludes events that have not expired yet", async () => {
+      // Rounding down is the safe direction: an unexpired event must never
+      // be filtered, even though an expired one may linger a bucket.
+      const nowMs = 1_788_198_037_000;
+      assert.ok(Number(await cutoffAt(nowMs)) <= Math.floor(nowMs / 1000));
+    });
+
+    it("holds the clause constant within a bucket and moves between them", async () => {
+      // The whole point: an identical clause is cacheable, a per-second one
+      // rebuilds a full-segment bitset on every query.
+      const base = 1_788_198_000_000;
+      assert.equal(await cutoffAt(base), await cutoffAt(base + 59_000));
+      assert.notEqual(await cutoffAt(base), await cutoffAt(base + 60_000));
+    });
+  });
+
   describe("bulkMaxQueue backpressure", () => {
     it("should reject event() with StorageOverloaded when queue is full", async () => {
       // Mock client whose bulk() never resolves — the queue fills up and

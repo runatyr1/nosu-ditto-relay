@@ -158,6 +158,28 @@ const ENGAGEMENT_QUERIES = [
 const DECAY_SORT_WINDOW_SECONDS = 7 * 24 * 3600;
 
 /**
+ * Granularity of the NIP-40 expiration cutoff attached to every query by
+ * `buildQuery`.
+ *
+ * `tags_map.expiration` is a keyword field (the `tags_map.*` dynamic
+ * template) holding millions of distinct values, so a range over it is a
+ * multi-term query: Lucene walks the terms dictionary and unions postings.
+ * It classifies such queries as costly and caches them as full-segment
+ * bitsets — which only pays off if the exact clause recurs. With a
+ * per-second cutoff it never does, so every query paid for a bitset build
+ * that was then discarded. Measured on the production index: ~12ms for a
+ * top-100 kind-1 query without the clause, ~100-200ms with a fresh cutoff,
+ * and ~13-19ms with a repeated one.
+ *
+ * Bucketing makes the clause identical for a whole minute, so one build
+ * amortizes over thousands of queries. The cost is that an expired event
+ * stays visible for up to a bucket past its expiration — NIP-40 only says
+ * relays SHOULD stop serving expired events, and `delete-expired-events`
+ * removes them for real.
+ */
+const EXPIRATION_BUCKET_SECONDS = 60;
+
+/**
  * Provides the current set of trusted pubkeys for engagement counting, or
  * `undefined` when trust filtering is inactive (no WoT configured, or the
  * first WoT computation hasn't completed). Consulted per recompute tick so
@@ -1592,10 +1614,16 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
 
     // NIP-40: Exclude expired events. Deletion opts out — an expired event is
     // still stored, and a vanish request must reach it.
+    //
+    // The cutoff is rounded down to EXPIRATION_BUCKET_SECONDS so the clause is
+    // byte-identical across a whole bucket. See the constant for why that
+    // matters; a per-second cutoff makes this the most expensive part of an
+    // otherwise cheap query.
     if (!opts?.includeExpired) {
       const now = Math.floor(Date.now() / 1000);
+      const cutoff = now - (now % EXPIRATION_BUCKET_SECONDS);
       mustNot.push({
-        range: { "tags_map.expiration": { lte: String(now) } },
+        range: { "tags_map.expiration": { lte: String(cutoff) } },
       });
     }
 
