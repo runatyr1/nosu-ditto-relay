@@ -87,6 +87,8 @@ the hot path.
 │   ├── media.ts            # Media/video detection from imeta tags and URLs
 │   ├── media.test.ts       # Media detection tests
 │   ├── errors.ts           # Typed ingest-backpressure errors (StorageOverloaded)
+│   ├── expiration.ts       # NIP-40 expiry check shared by relay and storage
+│   ├── expiration.test.ts  # Expiration tests
 │   ├── landing-page.ts     # HTML landing page served on GET /
 │   ├── landing-page.test.ts # Landing page tests
 │   ├── nip85.ts            # NIP-85 Trusted Assertions publisher (kinds 30382-30385)

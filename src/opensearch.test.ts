@@ -8348,6 +8348,69 @@ describe("OpenSearchRelay", () => {
       assert.equal(await cutoffAt(base), await cutoffAt(base + 59_000));
       assert.notEqual(await cutoffAt(base), await cutoffAt(base + 60_000));
     });
+
+    /** Query a relay whose index returns exactly `hits`, whatever is asked. */
+    const queryReturning = async (
+      hits: NostrEvent[],
+    ): Promise<NostrEvent[]> => {
+      const mockClient = {
+        search: async () => ({
+          body: {
+            hits: {
+              hits: hits.map((e) => ({ _source: e })),
+              total: { value: hits.length },
+            },
+          },
+        }),
+      } as unknown as Client;
+      return new OpenSearchRelay(mockClient).query([{ kinds: [1] }]);
+    };
+
+    it("drops events that expired inside the current bucket", async () => {
+      // The bucketed cutoff leaves these in the index's answer; the
+      // post-filter is what keeps them out of the client's.
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+      const live = finalizeEvent(
+        { kind: 1, created_at: now, tags: [], content: "live" },
+        sk,
+      );
+      const expired = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["expiration", String(now - 1)]],
+          content: "expired one second ago",
+        },
+        sk,
+      );
+
+      const events = await queryReturning([expired, live]);
+      assert.deepEqual(
+        events.map((e) => e.content),
+        ["live"],
+      );
+    });
+
+    it("keeps events whose expiration is still in the future", async () => {
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["expiration", String(now + 3600)]],
+          content: "expires in an hour",
+        },
+        sk,
+      );
+
+      const events = await queryReturning([event]);
+      assert.deepEqual(
+        events.map((e) => e.content),
+        ["expires in an hour"],
+      );
+    });
   });
 
   describe("bulkMaxQueue backpressure", () => {

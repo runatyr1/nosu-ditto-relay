@@ -3,6 +3,7 @@ import { NIP50, NKinds } from "@nostrify/nostrify";
 import { buildAutocompleteText } from "./autocomplete-text.ts";
 import type { Config } from "./config.ts";
 import { StorageOverloaded } from "./errors.ts";
+import { isExpired } from "./expiration.ts";
 import { clip, errFields, Logger } from "./log.ts";
 import { detectMedia } from "./media.ts";
 import {
@@ -172,10 +173,10 @@ const DECAY_SORT_WINDOW_SECONDS = 7 * 24 * 3600;
  * and ~13-19ms with a repeated one.
  *
  * Bucketing makes the clause identical for a whole minute, so one build
- * amortizes over thousands of queries. The cost is that an expired event
- * stays visible for up to a bucket past its expiration — NIP-40 only says
- * relays SHOULD stop serving expired events, and `delete-expired-events`
- * removes them for real.
+ * amortizes over thousands of queries. It widens the query's answer by at
+ * most the events that expired since the bucket began, and
+ * {@link OpenSearchRelay.hitsToEvents} drops those from the result, so
+ * what a client sees is unchanged.
  */
 const EXPIRATION_BUCKET_SECONDS = 60;
 
@@ -1247,13 +1248,34 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
 
   /**
    * Extract hits from an OpenSearch response as NostrEvent[].
+   *
+   * Expired events (NIP-40) are dropped here, which is what makes the
+   * bucketed cutoff in {@link buildQuery} safe: the query excludes
+   * everything expired as of the start of the current bucket, and this
+   * removes the stragglers that expired since. Filtering in memory over
+   * at most `limit` events costs a tag scan each, against a keyword range
+   * over millions of terms in OpenSearch.
+   *
+   * Every read path that returns events funnels through here and asks
+   * OpenSearch to exclude expired events, so the default filters. The
+   * paths that deliberately reach expired events — `remove` and
+   * `queryIdsBatch`, which pass `includeExpired` to `buildQuery` — read
+   * ids straight off the response instead and never arrive here; `opts`
+   * mirrors `buildQuery` so a future one can opt out explicitly rather
+   * than lose its hits to a filter it didn't know about.
    */
-  private hitsToEvents(response: {
-    body: SearchResponseBody<NostrEvent>;
-  }): NostrEvent[] {
-    return response.body.hits.hits.flatMap((hit) =>
+  private hitsToEvents(
+    response: {
+      body: SearchResponseBody<NostrEvent>;
+    },
+    opts?: { includeExpired?: boolean },
+  ): NostrEvent[] {
+    const events = response.body.hits.hits.flatMap((hit) =>
       hit._source !== undefined ? [hit._source] : [],
     );
+    if (opts?.includeExpired) return events;
+    const now = Math.floor(Date.now() / 1000);
+    return events.filter((event) => !isExpired(event, now));
   }
 
   /**
@@ -1618,7 +1640,8 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     // The cutoff is rounded down to EXPIRATION_BUCKET_SECONDS so the clause is
     // byte-identical across a whole bucket. See the constant for why that
     // matters; a per-second cutoff makes this the most expensive part of an
-    // otherwise cheap query.
+    // otherwise cheap query. This clause is therefore a coarse pre-filter —
+    // `hitsToEvents` drops whatever expired since the bucket began.
     if (!opts?.includeExpired) {
       const now = Math.floor(Date.now() / 1000);
       const cutoff = now - (now % EXPIRATION_BUCKET_SECONDS);
@@ -3092,6 +3115,12 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
    *
    * When distinct:author is present, uses a cardinality aggregation on pubkey
    * to return the number of unique authors instead of total events.
+   *
+   * A count is the one read that cannot post-filter expired events the way
+   * {@link hitsToEvents} does — there are no documents to inspect — so it
+   * may include events that expired within the current
+   * EXPIRATION_BUCKET_SECONDS. NIP-45 counts are already advertised as
+   * approximate.
    */
   async count(
     filters: NostrFilter[],

@@ -8,6 +8,7 @@ import { matchFilter, verifyEvent } from "nostr-tools";
 import type { AnalyzeResult } from "./analyze.ts";
 import { applyDeletionRequest, applyVanishRequest } from "./deletions.ts";
 import { StorageOverloaded } from "./errors.ts";
+import { isExpired } from "./expiration.ts";
 import { clip, errFields, Logger } from "./log.ts";
 import {
   relayBroadcastQueueGauge,
@@ -707,7 +708,7 @@ export class Relay {
    */
   private broadcastOne(event: NostrEvent): void {
     // NIP-40: Don't broadcast expired events
-    if (this.isExpired(event)) return;
+    if (isExpired(event)) return;
 
     // Collect candidate indexed filters: kind-specific + catchAll
     const kindSet = this.kindIndex.get(event.kind);
@@ -779,20 +780,6 @@ export class Relay {
   }
 
   /**
-   * Check if an event has expired (NIP-40) by checking the "expiration" tag.
-   * Returns true if the event has an expiration tag with a timestamp in the past.
-   */
-  private isExpired(event: NostrEvent): boolean {
-    const expirationTag = event.tags.find(
-      (tag) => tag[0] === "expiration" && tag.length >= 2,
-    );
-    if (!expirationTag) return false;
-    const expiration = Number.parseInt(expirationTag[1], 10);
-    if (Number.isNaN(expiration)) return false;
-    return expiration <= Math.floor(Date.now() / 1000);
-  }
-
-  /**
    * Check if an event contains any banned hashtag (NIP-12 `t` tag).
    * Matching is case-insensitive. Returns false when no hashtags are banned.
    */
@@ -843,7 +830,7 @@ export class Relay {
     }
 
     // NIP-40: Reject events that are already expired
-    if (this.isExpired(event)) {
+    if (isExpired(event)) {
       return {
         eventId: event.id,
         accepted: false,
