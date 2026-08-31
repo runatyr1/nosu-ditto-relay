@@ -22,9 +22,21 @@ import { Nip85 } from "./nip85.ts";
 import { OpenSearchRelay, type TrustProvider } from "./opensearch.ts";
 import { Client as OpenSearchClient } from "./opensearch-client.ts";
 import { Trends } from "./trends.ts";
+// Installs a buffering `self.onmessage` at import time, so dirty batches
+// posted before this module finishes evaluating can't be dropped.
+import { onWorkerMessage } from "./worker-inbox.ts";
 import { Wot } from "./wot.ts";
 
 declare var self: Worker;
+
+/** Dirty references forwarded by the main thread (drained from the indexer). */
+interface DirtyMessage {
+  type: "dirty";
+  ids: string[];
+  pubkeys: string[];
+  addrs: string[];
+  identifiers: string[];
+}
 
 // ---------------------------------------------------------------------------
 // Initialise from environment (same .env as main process)
@@ -183,7 +195,7 @@ if (trendsIntervalMs > 0) {
 // recomputeScores() drains them.
 // ---------------------------------------------------------------------------
 
-self.onmessage = (event: MessageEvent) => {
+onWorkerMessage<DirtyMessage>((event) => {
   const msg = event.data;
 
   if (msg.type === "dirty") {
@@ -193,7 +205,7 @@ self.onmessage = (event: MessageEvent) => {
     if (msg.identifiers.length > 0)
       nip85.addDirtyIdentifiers(new Set(msg.identifiers));
   }
-};
+});
 
 // ---------------------------------------------------------------------------
 // Score recomputation loop — runs every 5s

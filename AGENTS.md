@@ -70,6 +70,8 @@ the hot path.
 │   ├── protocol-worker.ts  # Protocol worker: connections + all per-message work
 │   ├── indexer-worker.ts   # Indexer worker: owns writes on the ingest path
 │   ├── indexer-client.ts   # Write-RPC client + port protocol (used in protocol workers)
+│   ├── worker-inbox.ts     # Buffers messages arriving before a worker installs its handler
+│   ├── worker-inbox.test.ts # Worker inbox buffering tests
 │   ├── relay.ts            # Relay implementation (event handling, subscriptions)
 │   ├── relay.test.ts       # Relay tests
 │   ├── opensearch.ts       # OpenSearch backend (storage, querying, NIP-50)

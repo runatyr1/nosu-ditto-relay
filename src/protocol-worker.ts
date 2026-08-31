@@ -39,6 +39,10 @@ import {
   type RelayConn,
   type SyncableStorage,
 } from "./relay.ts";
+// Installs a buffering `self.onmessage` at import time. Load-bearing: the
+// top-level `await`s below suspend this module's evaluation, and messages
+// arriving in that window are dropped if no handler is installed yet.
+import { onWorkerMessage } from "./worker-inbox.ts";
 
 // ---------------------------------------------------------------------------
 // Initialise from environment (same .env as the main process)
@@ -189,7 +193,7 @@ function openConn(id: number, ip?: string, userAgent?: string): void {
 // Message handling
 // ---------------------------------------------------------------------------
 
-self.onmessage = (event: MessageEvent<ToProtocolWorker>) => {
+onWorkerMessage<ToProtocolWorker>((event) => {
   const msg = event.data;
   switch (msg.t) {
     case "indexer_port":
@@ -247,7 +251,7 @@ self.onmessage = (event: MessageEvent<ToProtocolWorker>) => {
       });
       break;
   }
-};
+});
 
 // Signal readiness with the relay info document (identical across workers).
 // The pool waits for this before routing connections — and before

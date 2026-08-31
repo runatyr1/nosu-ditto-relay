@@ -163,9 +163,10 @@ export class ProtocolPool {
 
   /**
    * Wire one protocol worker to the indexer with a fresh MessageChannel.
-   * Both messages may be posted while the workers are still evaluating
-   * their modules; worker message queues hold them until the onmessage
-   * handlers install.
+   * Both messages are posted while the workers are still evaluating their
+   * modules. Nothing in the runtime holds a message until a handler exists
+   * — the workers buffer for themselves from their first import (see
+   * worker-inbox.ts) — so this must not be reordered to wait for "ready".
    */
   private connectIndexer(workerIndex: number): void {
     const channel = new MessageChannel();
@@ -296,9 +297,10 @@ export class ProtocolPool {
     });
 
     // Respawn immediately: a rare crash (poison-pill message) recovers
-    // fastest this way, and new opens routed to this slot queue in the
-    // worker's message queue until it's ready. Persistent failures are
-    // handled by the crash-loop guard in recordDeath, not by backoff here.
+    // fastest this way, and new opens routed to this slot are buffered by
+    // the fresh worker (worker-inbox.ts) until it's ready. Persistent
+    // failures are handled by the crash-loop guard in recordDeath, not by
+    // backoff here.
     this.spawnWorker(workerIndex);
 
     if (lost.length > 0) {

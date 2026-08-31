@@ -30,6 +30,9 @@ import { register, startRuntimeMetrics } from "./metrics.ts";
 import { OpenSearchRelay } from "./opensearch.ts";
 import type { ClientOptions } from "./opensearch-client.ts";
 import { Client as OpenSearchClient } from "./opensearch-client.ts";
+// Installs a buffering `self.onmessage` at import time, so a port posted by
+// the pool before this module finishes evaluating can't be dropped.
+import { onWorkerMessage } from "./worker-inbox.ts";
 
 // ---------------------------------------------------------------------------
 // Initialise from environment (same .env as the main process)
@@ -195,7 +198,7 @@ function attachPort(port: MessagePort): void {
 // Main-thread channel: ports in, metrics/dirty out
 // ---------------------------------------------------------------------------
 
-self.onmessage = (event: MessageEvent<ToIndexerWorker>) => {
+onWorkerMessage<ToIndexerWorker>((event) => {
   const msg = event.data;
   switch (msg.t) {
     case "port":
@@ -211,7 +214,7 @@ self.onmessage = (event: MessageEvent<ToIndexerWorker>) => {
       });
       break;
   }
-};
+});
 
 self.postMessage({ t: "ready" } satisfies FromIndexerWorker);
 
