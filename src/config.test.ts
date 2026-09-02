@@ -402,6 +402,27 @@ describe("Config", () => {
     });
   });
 
+  describe("nsfwHashtags", () => {
+    it("should default to the built-in NSFW hashtag set when not set", () => {
+      const config = new Config(baseEnv());
+      assert.ok(config.nsfwHashtags.size > 0);
+      assert.ok(config.nsfwHashtags.has("nsfw"));
+      assert.ok(config.nsfwHashtags.has("porn"));
+    });
+
+    it("should parse comma-separated hashtags, lowercased and trimmed", () => {
+      const config = new Config(
+        baseEnv([["NSFW_HASHTAGS", " Lewd , , NSFW "]]),
+      );
+      assert.deepEqual(config.nsfwHashtags, new Set(["lewd", "nsfw"]));
+    });
+
+    it("should disable classification with an explicit empty string", () => {
+      const config = new Config(baseEnv([["NSFW_HASHTAGS", ""]]));
+      assert.deepEqual(config.nsfwHashtags, new Set());
+    });
+  });
+
   describe("rejectedKinds", () => {
     it("should default to seal/auth/zap-request artifact kinds", () => {
       const config = new Config(baseEnv());

@@ -16,6 +16,7 @@ import {
   opensearchSlotDeepHistoryCounter,
   opensearchSlotDuplicatesCounter,
 } from "./metrics.ts";
+import { DEFAULT_NSFW_HASHTAGS, detectNsfw } from "./nsfw.ts";
 import type {
   ClientOptions,
   MsearchResponseItem,
@@ -263,6 +264,11 @@ interface NostrEventDocument extends NostrEvent {
   sentiment?: string;
   media: boolean;
   video: boolean;
+  /**
+   * NSFW classification: media attachment + an NSFW hashtag (see nsfw.ts).
+   * Queried by the NIP-50 `nsfw:false` extension (excludes flagged events).
+   */
+  nsfw: boolean;
   /**
    * NIP-13 proof-of-work difficulty: the number of leading zero bits in the
    * event `id`, clamped to any committed target in the `nonce` tag. Events
@@ -572,6 +578,9 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
   /** Per-instance override of TAG_VALUE_MAX_COUNT_PER_NAME. */
   private tagValueMaxCountPerName: number;
 
+  /** Lowercase NSFW hashtag set used by the ingest fallback (see nsfw.ts). */
+  private nsfwHashtags: ReadonlySet<string>;
+
   /**
    * Maximum number of events permitted to sit in the bulk queue. When
    * exceeded, {@link event} rejects new events with {@link StorageOverloaded}
@@ -610,6 +619,13 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
        */
       tagValueMaxCountPerName?: number;
       /**
+       * Lowercase NSFW hashtag set for the ingest-path fallback when no
+       * pre-computed analysis is supplied (see nsfw.ts). Defaults to
+       * {@link DEFAULT_NSFW_HASHTAGS}; entry points inject
+       * `Config.nsfwHashtags`.
+       */
+      nsfwHashtags?: ReadonlySet<string>;
+      /**
        * Structured logger. Defaults to a fresh `info`-level Logger; entry
        * points inject one built from `Config.logLevel`.
        */
@@ -632,6 +648,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     this.tagValueMaxCountPerName =
       opts?.tagValueMaxCountPerName ??
       OpenSearchRelay.TAG_VALUE_MAX_COUNT_PER_NAME;
+    this.nsfwHashtags = opts?.nsfwHashtags ?? DEFAULT_NSFW_HASHTAGS;
   }
 
   /**
@@ -657,6 +674,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       historyKindsExcluded: config.historyKindsExcluded,
       authKinds: config.authKinds,
       tagValueMaxCountPerName: config.tagValueMaxCountPerName,
+      nsfwHashtags: config.nsfwHashtags,
       logger: new Logger(config.logLevel),
     });
   }
@@ -887,6 +905,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       sentiment?: string;
       media?: boolean;
       video?: boolean;
+      nsfw?: boolean;
     },
   ): NostrEventDocument {
     const tagsMap = this.buildTagsMap(event.tags, event.kind);
@@ -929,6 +948,14 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         ? { media: analysis.media, video: analysis.video }
         : OpenSearchRelay.detectMedia(event);
 
+    // NSFW rides on media detection: when the analyzer computed media it
+    // also computed nsfw (absent = false); otherwise classify here using
+    // the local media result.
+    const nsfw =
+      analysis?.media !== undefined
+        ? (analysis.nsfw ?? false)
+        : detectNsfw(event, mediaResult.media, this.nsfwHashtags);
+
     // Use pre-computed autocomplete text from the analyze worker when
     // available; otherwise build on the main thread (direct event() calls,
     // tests). Only set the field when non-empty so events with no
@@ -950,6 +977,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       ...(sentiment && { sentiment }),
       media: mediaResult.media ?? false,
       video: mediaResult.video ?? false,
+      nsfw,
       pow: getPow(event),
       followers: 0,
       engagers: 0,
@@ -1830,6 +1858,20 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         }
       }
 
+      // Handle nsfw: extension (NIP-50). Per the NIP, nsfw events are
+      // included by default; `nsfw:false` excludes them. `nsfw:true`
+      // restores the default (no clause) rather than meaning "only nsfw".
+      const nsfwToken = tokens.find(
+        (t) => typeof t === "object" && t.key === "nsfw",
+      );
+      if (
+        nsfwToken &&
+        typeof nsfwToken === "object" &&
+        nsfwToken.value === "false"
+      ) {
+        mustNot.push({ term: { nsfw: true } });
+      }
+
       // Handle pow: extension (NIP-50 + NIP-13).
       // `pow:<n>` matches events whose stored proof-of-work difficulty is
       // at least `n` leading zero bits. Events without a `nonce` tag are
@@ -1990,6 +2032,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         sentiment?: string;
         media?: boolean;
         video?: boolean;
+        nsfw?: boolean;
       };
     },
   ): Promise<void> {
@@ -3386,6 +3429,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     sentiment: { type: "keyword" },
     media: { type: "boolean" },
     video: { type: "boolean" },
+    nsfw: { type: "boolean" },
     pow: { type: "integer" },
     followers: { type: "integer" },
     engagers: { type: "integer" },

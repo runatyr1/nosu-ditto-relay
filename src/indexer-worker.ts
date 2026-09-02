@@ -68,6 +68,7 @@ const opensearchRelay = new OpenSearchRelay(
     authKinds: config.authKinds,
     writeClient: new OpenSearchClient(opensearchClientOptions),
     tagValueMaxCountPerName: config.tagValueMaxCountPerName,
+    nsfwHashtags: config.nsfwHashtags,
     bulkMaxQueue: config.bulkMaxQueue,
     logger: log,
   },

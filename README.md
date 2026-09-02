@@ -174,6 +174,9 @@ The following NIP-50 search extensions are supported:
 - `sentiment:<value>` — Filter by sentiment: `positive`, `negative`, `neutral`
 - `media:true` / `media:false` — Filter by presence of media attachments
 - `video:true` / `video:false` — Filter by whether all attachments are video
+- `nsfw:false` — Exclude NSFW events (a media attachment plus an NSFW hashtag,
+  see `NSFW_HASHTAGS`). NSFW events are included by default per NIP-50;
+  `nsfw:true` is accepted as a no-op.
 - `pow:<n>` — Filter by NIP-13 proof-of-work difficulty: matches events whose
   `id` has at least `n` leading zero bits, clamped to the committed target in
   the `nonce` tag. Events without a `nonce` tag have `pow:0`, e.g. `pow:20`.
@@ -245,6 +248,7 @@ All options:
 | `DITTO_LANGUAGES` | ISO 639-1 codes for per-language trends | unset |
 | `REJECTED_KINDS` | Kinds rejected at ingestion | `13,9734,20013,20014,22242,24242,27235` |
 | `BANNED_HASHTAGS` | `t` tag values rejected at ingestion | unset |
+| `NSFW_HASHTAGS` | `t` tag values that mark events with media as NSFW (`nsfw:false` excludes them; empty disables) | `nsfw,porn,...` |
 | `RELAY_MAX_MESSAGE_LENGTH` | Max inbound message size (bytes) | `4000000` |
 | `RELAY_MAX_FILTER_VALUES` | Max entries per filter array field | `20000` |
 | `RELAY_TAG_VALUE_MAX_COUNT_PER_NAME` | Max indexed values per tag name | `5000` |

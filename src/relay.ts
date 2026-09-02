@@ -95,6 +95,7 @@ export interface EventAnalysis {
   sentiment?: string;
   media?: boolean;
   video?: boolean;
+  nsfw?: boolean;
 }
 
 /**
@@ -944,6 +945,7 @@ export class Relay {
           sentiment: analysis.sentiment,
           media: analysis.media,
           video: analysis.video,
+          nsfw: analysis.nsfw,
         },
       };
       await this.storage.event(event, eventOpts);

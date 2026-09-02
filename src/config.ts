@@ -3,6 +3,7 @@ import { NSecSigner } from "@nostrify/nostrify";
 import { nip19 } from "nostr-tools";
 
 import type { LogLevel } from "./log.ts";
+import { DEFAULT_NSFW_HASHTAGS } from "./nsfw.ts";
 
 export class Config {
   readonly port: number;
@@ -141,6 +142,15 @@ export class Config {
    * Comma-separated, case-insensitive. Default: empty (no hashtags banned).
    */
   readonly bannedHashtags: Set<string>;
+  /**
+   * Set of NSFW hashtags (lowercased `t` tag values). An event carrying both
+   * a media attachment and any of these hashtags is indexed with `nsfw: true`
+   * and can be excluded from search results with the NIP-50 `nsfw:false`
+   * extension token. Comma-separated, case-insensitive. Set to an empty value
+   * to disable NSFW classification. Default: see `DEFAULT_NSFW_HASHTAGS` in
+   * nsfw.ts.
+   */
+  readonly nsfwHashtags: Set<string>;
   /**
    * Set of kind numbers that are rejected at ingestion regardless of any
    * other policy. Events matching these kinds get an `OK: false` reply with
@@ -474,6 +484,18 @@ export class Config {
         .map((s) => s.trim().toLowerCase())
         .filter((s) => s.length > 0);
       this.bannedHashtags = new Set(tags);
+    }
+
+    // nsfwHashtags: unset = defaults; explicitly empty = classification off.
+    const nsfwHashtagsValue = env.get("NSFW_HASHTAGS");
+    if (nsfwHashtagsValue === undefined) {
+      this.nsfwHashtags = new Set(DEFAULT_NSFW_HASHTAGS);
+    } else {
+      const tags = nsfwHashtagsValue
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0);
+      this.nsfwHashtags = new Set(tags);
     }
 
     // rejectedKinds

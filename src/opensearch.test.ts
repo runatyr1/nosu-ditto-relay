@@ -6638,6 +6638,254 @@ describe("OpenSearchRelay", () => {
     });
   });
 
+  describe("NIP-50 nsfw filter", () => {
+    // Mock client honoring the must_not term clause on the nsfw field.
+    const createNsfwMockClient = () => {
+      const documents = new Map<string, unknown>();
+
+      return {
+        documents,
+        client: {
+          search: async ({ body }: { body: Record<string, unknown> }) => {
+            const results: unknown[] = [];
+            const bool = (body.query as Record<string, unknown>)?.bool as
+              | Record<string, unknown>
+              | undefined;
+            const mustNot = bool?.must_not as
+              | Array<Record<string, unknown>>
+              | undefined;
+
+            // nsfw:false produces must_not: [{ term: { nsfw: true } }]
+            let excludeNsfw = false;
+            for (const clause of mustNot || []) {
+              if ((clause.term as Record<string, unknown>)?.nsfw === true) {
+                excludeNsfw = true;
+              }
+            }
+
+            for (const [_id, doc] of documents.entries()) {
+              const docTyped = doc as NostrEvent & {
+                deleted?: boolean;
+                nsfw?: boolean;
+              };
+
+              if (docTyped.deleted) continue;
+              if (excludeNsfw && docTyped.nsfw === true) continue;
+
+              results.push({ _source: doc });
+            }
+
+            return {
+              body: {
+                hits: { hits: results },
+              },
+            };
+          },
+          bulk: async ({ body }: { body: unknown[] }) => {
+            const items: Array<Record<string, unknown>> = [];
+            for (let i = 0; i < body.length; i += 2) {
+              const action = body[i] as {
+                index?: { _id: string };
+                update?: { _id: string };
+              };
+              const payload = body[i + 1] as Record<string, unknown>;
+
+              if (action.index) {
+                documents.set(action.index._id, payload);
+                items.push({ index: {} });
+              } else if (action.update) {
+                if (payload.upsert) {
+                  if (!documents.has(action.update._id)) {
+                    documents.set(action.update._id, payload.upsert);
+                  }
+                }
+                items.push({ update: {} });
+              }
+            }
+            return {
+              body: {
+                errors: false,
+                items,
+              },
+            };
+          },
+          mget: async ({ body }: { body: { ids: string[] } }) => {
+            const docs = body.ids.map((id) => {
+              const doc = documents.get(id);
+              if (doc) return { found: true, _id: id, _source: doc };
+              return { found: false, _id: id };
+            });
+            return { body: { docs } };
+          },
+          count: async () => {
+            const nonDeleted = Array.from(documents.values()).filter(
+              (doc) => !(doc as { deleted?: boolean }).deleted,
+            );
+            return { body: { count: nonDeleted.length } };
+          },
+          updateByQuery: async () => ({ body: { updated: 0 } }),
+          msearch: async (requests: unknown[]) => ({
+            body: {
+              responses: requests.map(() => ({ hits: { hits: [] } })),
+            },
+          }),
+          indices: {
+            exists: async () => ({ body: true }),
+            create: async () => ({ body: {} }),
+          },
+          close: async () => {},
+        },
+      };
+    };
+
+    it("should store nsfw on indexed documents when passed via analysis", async () => {
+      const { client, documents } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+
+      await relay.event(event, { analysis: { media: true, nsfw: true } });
+
+      const doc = Array.from(documents.values())[0] as { nsfw?: boolean };
+      assert.equal(doc.nsfw, true);
+    });
+
+    it("should classify nsfw at ingest when no analysis is provided", async () => {
+      const { client, documents } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      // NSFW hashtag + media attachment: flagged.
+      const flagged = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "NSFW"]],
+          content: "look at this https://example.com/pic.jpg",
+        },
+        sk,
+      );
+
+      // NSFW hashtag but no attachment: not flagged.
+      const textOnly = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now - 10,
+          tags: [["t", "nsfw"]],
+          content: "just talking about the nsfw hashtag",
+        },
+        sk,
+      );
+
+      await relay.event(flagged);
+      await relay.event(textOnly);
+
+      const flaggedDoc = documents.get(flagged.id) as { nsfw?: boolean };
+      const textOnlyDoc = documents.get(textOnly.id) as { nsfw?: boolean };
+      assert.equal(flaggedDoc.nsfw, true);
+      assert.equal(textOnlyDoc.nsfw, false);
+    });
+
+    it("should exclude flagged events with nsfw:false", async () => {
+      const { client } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      const flagged = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+      const safe = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now - 10,
+          tags: [],
+          content: "a perfectly safe post",
+        },
+        sk,
+      );
+
+      await relay.event(flagged, { analysis: { media: true, nsfw: true } });
+      await relay.event(safe, { analysis: { media: false } });
+
+      const results = await relay.query([{ kinds: [1], search: "nsfw:false" }]);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].id, safe.id);
+    });
+
+    it("should include flagged events by default and with nsfw:true", async () => {
+      const { client } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      const flagged = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+      const safe = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now - 10,
+          tags: [],
+          content: "a perfectly safe post",
+        },
+        sk,
+      );
+
+      await relay.event(flagged, { analysis: { media: true, nsfw: true } });
+      await relay.event(safe, { analysis: { media: false } });
+
+      const noToken = await relay.query([{ kinds: [1] }]);
+      assert.equal(noToken.length, 2);
+
+      const nsfwTrue = await relay.query([{ kinds: [1], search: "nsfw:true" }]);
+      assert.equal(nsfwTrue.length, 2);
+    });
+  });
+
   describe("NIP-50 sentiment filter", () => {
     // Mock client with sentiment field support
     const createSentimentMockClient = () => {
@@ -8017,6 +8265,7 @@ describe("OpenSearchRelay", () => {
         "sentiment",
         "media",
         "video",
+        "nsfw",
         "pow",
         "followers",
         "engagers",
