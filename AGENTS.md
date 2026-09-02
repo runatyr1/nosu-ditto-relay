@@ -166,7 +166,7 @@ Edit `.env` to configure the application:
 - `PROTOCOL_WORKERS` - Number of protocol worker threads. Unset = auto
   (`max(1, min(16, floor(cores / 4)))`); must be `>= 1` when set.
 - `AUTH_KINDS` - Comma-separated kinds requiring NIP-42 AUTH for REQ/COUNT and
-  excluded from unscoped queries (default: `4,1059,30078` — DMs, gift wraps,
+  excluded from unscoped queries (default: `4,78,1059,30078` — DMs, gift wraps,
   and NIP-78 application-specific data).
 - `AUTH_AUTHOR_EXEMPT_KINDS` - Subset of `AUTH_KINDS` served WITHOUT
   authentication to filters naming a non-empty `authors` list (when every

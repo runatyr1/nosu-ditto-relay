@@ -236,9 +236,9 @@ describe("Config", () => {
   });
 
   describe("authKinds", () => {
-    it("should default to kinds 4, 1059, and 30078", () => {
+    it("should default to kinds 4, 78, 1059, and 30078", () => {
       const config = new Config(baseEnv());
-      assert.deepEqual(config.authKinds, new Set([4, 1059, 30078]));
+      assert.deepEqual(config.authKinds, new Set([4, 78, 1059, 30078]));
     });
 
     it("should parse comma-separated kind numbers", () => {

@@ -49,7 +49,7 @@ export class Config {
    * Filters including these kinds must have `authors` or `#p` arrays where ALL
    * entries are authenticated pubkeys on the connection.
    * These kinds are also excluded from queries that don't explicitly include them.
-   * Default: 4,1059,30078 (NIP-04 DMs, NIP-59 gift wraps, and NIP-78
+   * Default: 4,78,1059,30078 (NIP-04 DMs, NIP-59 gift wraps, and NIP-78
    * application-specific data).
    */
   readonly authKinds: Set<number>;
@@ -319,7 +319,7 @@ export class Config {
     // authKinds
     const authValue = env.get("AUTH_KINDS");
     if (authValue === undefined) {
-      this.authKinds = new Set([4, 1059, 30078]);
+      this.authKinds = new Set([4, 78, 1059, 30078]);
     } else {
       const kinds = authValue
         .split(",")
