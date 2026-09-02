@@ -423,6 +423,43 @@ describe("Config", () => {
     });
   });
 
+  describe("rejectNsfw", () => {
+    it("should default to false", () => {
+      const config = new Config(baseEnv());
+      assert.equal(config.rejectNsfw, false);
+    });
+
+    it("should accept true and 1", () => {
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "true"]])).rejectNsfw,
+        true,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "TRUE"]])).rejectNsfw,
+        true,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "1"]])).rejectNsfw,
+        true,
+      );
+    });
+
+    it("should treat any other value as false", () => {
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "false"]])).rejectNsfw,
+        false,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "0"]])).rejectNsfw,
+        false,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", ""]])).rejectNsfw,
+        false,
+      );
+    });
+  });
+
   describe("rejectedKinds", () => {
     it("should default to seal/auth/zap-request artifact kinds", () => {
       const config = new Config(baseEnv());

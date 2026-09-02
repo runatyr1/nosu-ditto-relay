@@ -189,6 +189,11 @@ Edit `.env` to configure the application:
   long-tail compounds are deliberately excluded). Run
   `scripts/backfill-nsfw.ts` after enabling — or after changing the set — on
   an existing index.
+- `REJECT_NSFW` - `true`/`1` to reject NSFW events at ingestion (`OK false
+  "blocked: this relay does not accept NSFW content"`) instead of storing
+  them with `nsfw: true`. Uses the same classification as `NSFW_HASHTAGS`,
+  so an empty hashtag set rejects nothing. Only affects new ingests —
+  already-indexed NSFW events stay put. Default: `false`.
 - `WOT_SEED_PUBKEYS` - Comma-separated hex pubkeys seeding the engagement
   web of trust. The background worker expands them 2 follow-hops via kind 3
   contact lists in the local index (hourly); while the set is available,

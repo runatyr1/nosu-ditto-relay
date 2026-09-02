@@ -776,6 +776,95 @@ describe("Relay", () => {
     });
   });
 
+  describe("rejectNsfw", () => {
+    /** Build an event whose analysis reports the given `nsfw` classification. */
+    const nsfwAnalyze = (nsfw: boolean) => () => ({ verified: true, nsfw });
+
+    it("should reject an event the analyzer classified as NSFW", async () => {
+      let storageEventCalled = false;
+      const storage = {
+        ...mockStorage,
+        event: async () => {
+          storageEventCalled = true;
+        },
+      } as unknown as AnalyzableRelay;
+      const nsfwRelay = new Relay(storage, {
+        relayUrl: "wss://relay.test/",
+        rejectNsfw: true,
+        analyze: nsfwAnalyze(true),
+      });
+
+      const sk = generateSecretKey();
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+
+      await nsfwRelay.handleEvent(mockWs, event);
+
+      assert.equal(sentMessages.length, 1);
+      assert.deepEqual(sentMessages[0], [
+        "OK",
+        event.id,
+        false,
+        "blocked: this relay does not accept NSFW content",
+      ]);
+      assert.equal(storageEventCalled, false);
+    });
+
+    it("should accept a non-NSFW event when rejectNsfw is on", async () => {
+      const nsfwRelay = new Relay(mockStorage, {
+        relayUrl: "wss://relay.test/",
+        rejectNsfw: true,
+        analyze: nsfwAnalyze(false),
+      });
+
+      const sk = generateSecretKey();
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [["t", "nostr"]],
+          content: "hello",
+        },
+        sk,
+      );
+
+      await nsfwRelay.handleEvent(mockWs, event);
+      nsfwRelay.flushBroadcasts();
+
+      assert.deepEqual(sentMessages[0], ["OK", event.id, true, ""]);
+    });
+
+    it("should accept NSFW events by default", async () => {
+      const nsfwRelay = new Relay(mockStorage, {
+        relayUrl: "wss://relay.test/",
+        analyze: nsfwAnalyze(true),
+      });
+
+      const sk = generateSecretKey();
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+
+      await nsfwRelay.handleEvent(mockWs, event);
+      nsfwRelay.flushBroadcasts();
+
+      assert.deepEqual(sentMessages[0], ["OK", event.id, true, ""]);
+    });
+  });
+
   describe("rejected kinds", () => {
     it("should reject an event whose kind is on the rejected list", async () => {
       let storageEventCalled = false;

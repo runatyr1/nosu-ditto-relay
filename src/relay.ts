@@ -317,6 +317,8 @@ export class Relay {
   private maxLimit: number;
   /** Lowercased `t` tag values that cause an event to be rejected at ingestion. */
   private bannedHashtags: Set<string>;
+  /** Whether events classified NSFW by the analyzer are rejected at ingestion. */
+  private rejectNsfw: boolean;
   /** Kind numbers that are rejected at ingestion regardless of other policy. */
   private rejectedKinds: Set<number>;
   /** Structured logger, injected by the server entry point. */
@@ -465,6 +467,13 @@ export class Relay {
        */
       bannedHashtags?: Set<string>;
       /**
+       * Reject events the analyzer classified as NSFW instead of storing them
+       * with the flag set. Depends entirely on the analyzer's `nsfw` bit, so
+       * a relay whose NSFW hashtag set is empty rejects nothing.
+       * Default: false.
+       */
+      rejectNsfw?: boolean;
+      /**
        * Set of kind numbers that are rejected at ingestion regardless of any
        * other policy. Events matching these kinds get an `OK: false` reply
        * with a `blocked:` message and are never stored. Default: empty.
@@ -502,6 +511,7 @@ export class Relay {
     this.defaultLimit = Math.min(opts.defaultLimit ?? 100, this.maxLimit);
     this.maxInflightPerConn = opts.maxInflightPerConn ?? 32;
     this.bannedHashtags = opts.bannedHashtags ?? new Set();
+    this.rejectNsfw = opts.rejectNsfw ?? false;
     this.rejectedKinds = opts.rejectedKinds ?? new Set();
     this.negentropyMaxRecords = opts.negentropyMaxRecords ?? 1_000_000;
     this.relayInfo = {
@@ -856,6 +866,17 @@ export class Relay {
         eventId: event.id,
         accepted: false,
         message: "blocked: event contains a banned hashtag",
+      };
+    }
+
+    // Reject NSFW events when the relay is configured not to host them.
+    // Uses the analyzer's classification (media attachment + NSFW hashtag),
+    // the same bit that would otherwise be indexed as `nsfw: true`.
+    if (this.rejectNsfw && analysis.nsfw) {
+      return {
+        eventId: event.id,
+        accepted: false,
+        message: "blocked: this relay does not accept NSFW content",
       };
     }
 

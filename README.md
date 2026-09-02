@@ -249,6 +249,7 @@ All options:
 | `REJECTED_KINDS` | Kinds rejected at ingestion | `13,9734,20013,20014,22242,24242,27235` |
 | `BANNED_HASHTAGS` | `t` tag values rejected at ingestion | unset |
 | `NSFW_HASHTAGS` | `t` tag values that mark events with media as NSFW (`nsfw:false` excludes them; empty disables) | `nsfw,porn,...` |
+| `REJECT_NSFW` | Reject NSFW events at ingestion instead of indexing them | `false` |
 | `RELAY_MAX_MESSAGE_LENGTH` | Max inbound message size (bytes) | `4000000` |
 | `RELAY_MAX_FILTER_VALUES` | Max entries per filter array field | `20000` |
 | `RELAY_TAG_VALUE_MAX_COUNT_PER_NAME` | Max indexed values per tag name | `5000` |

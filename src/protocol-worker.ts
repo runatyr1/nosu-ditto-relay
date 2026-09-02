@@ -156,6 +156,7 @@ const relay = new Relay(storage, {
   maxEventTags: config.tagValueMaxCountPerName,
   maxInflightPerConn: config.maxInflightPerConn,
   bannedHashtags: config.bannedHashtags,
+  rejectNsfw: config.rejectNsfw,
   rejectedKinds: config.rejectedKinds,
   negentropyMaxRecords: config.negentropyMaxRecords,
   onEventAccepted: (event) => {

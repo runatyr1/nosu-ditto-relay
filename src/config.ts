@@ -152,6 +152,15 @@ export class Config {
    */
   readonly nsfwHashtags: Set<string>;
   /**
+   * Whether to reject NSFW events at ingestion instead of merely indexing
+   * them with `nsfw: true`. Matching events get an `OK: false` reply with a
+   * `blocked:` message and are never stored. Classification is unchanged —
+   * it still requires both a media attachment and a hashtag from
+   * `nsfwHashtags`, so an empty `NSFW_HASHTAGS` disables this too.
+   * Default: false (classify but accept).
+   */
+  readonly rejectNsfw: boolean;
+  /**
    * Set of kind numbers that are rejected at ingestion regardless of any
    * other policy. Events matching these kinds get an `OK: false` reply with
    * a `blocked:` message and are never stored. Comma-separated.
@@ -497,6 +506,11 @@ export class Config {
         .filter((s) => s.length > 0);
       this.nsfwHashtags = new Set(tags);
     }
+
+    // rejectNsfw
+    const rejectNsfwValue = env.get("REJECT_NSFW");
+    this.rejectNsfw =
+      rejectNsfwValue?.toLowerCase() === "true" || rejectNsfwValue === "1";
 
     // rejectedKinds
     const rejectedKindsValue = env.get("REJECTED_KINDS");
