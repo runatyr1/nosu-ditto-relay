@@ -129,8 +129,8 @@ The relay sends AUTH challenges lazily, only when a client requests something
 that requires authentication. A single connection can authenticate as multiple
 pubkeys; each successful AUTH adds to the set.
 
-Kinds listed in `AUTH_KINDS` (default `4,1059` — NIP-04 DMs and NIP-59 gift
-wraps) are auth-protected:
+Kinds listed in `AUTH_KINDS` (default `4,1059,30078` — NIP-04 DMs, NIP-59 gift
+wraps, and NIP-78 application-specific data) are auth-protected:
 
 - REQ/COUNT filters requesting an auth-protected kind must include `authors`
   or `#p`, and all entries of at least one of those lists must be
@@ -237,7 +237,7 @@ All options:
 | `OPENSEARCH_INDEX` | Index name | `nostr-events` |
 | `OPENSEARCH_USERNAME` | OpenSearch basic-auth username | unset |
 | `OPENSEARCH_PASSWORD` | OpenSearch basic-auth password | unset |
-| `AUTH_KINDS` | Kinds requiring NIP-42 AUTH to query | `4,1059` |
+| `AUTH_KINDS` | Kinds requiring NIP-42 AUTH to query | `4,1059,30078` |
 | `AUTH_AUTHOR_EXEMPT_KINDS` | Auth kinds readable unauthenticated via explicit `authors` filters | `1059` |
 | `HISTORY_ENABLED` | Preserve history of replaceable events | `true` |
 | `HISTORY_KINDS_WHITELIST` | Only these kinds get history | unset |
