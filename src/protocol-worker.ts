@@ -72,12 +72,7 @@ if (config.opensearchUsername && config.opensearchPassword) {
 const opensearchReadClient = new OpenSearchClient(opensearchClientOptions);
 
 const opensearchRelay = new OpenSearchRelay(opensearchReadClient, {
-  indexName: config.opensearchIndex,
-  historyEnabled: config.historyEnabled,
-  historyKindsWhitelist: config.historyKindsWhitelist,
-  historyKindsExcluded: config.historyKindsExcluded,
-  authKinds: config.authKinds,
-  tagValueMaxCountPerName: config.tagValueMaxCountPerName,
+  ...OpenSearchRelay.optionsFromConfig(config),
   logger: log,
 });
 

@@ -9761,6 +9761,68 @@ describe("OpenSearchRelay.seedDirtyEngaged", () => {
       });
     });
 
+    describe("config wiring", () => {
+      // Regression: the tests above construct the relay directly, so they
+      // passed while the feature was inert in production. The protocol
+      // workers — which answer every REQ — listed their options by hand and
+      // omitted `spamThreshold`, while still passing it to the analyzer. So
+      // replies were scored on ingest and no query ever applied the score.
+      // Entry points now spread `optionsFromConfig`; this covers that path.
+      const configWith = (...overrides: [string, string][]) =>
+        new Config(
+          new Map<string, string>([
+            ["RELAY_URL", "wss://relay.example.com/"],
+            [
+              "NOSTR_NSEC",
+              "nsec1l2xejwnzu9sjl9ve3eryktge5u05esdez9ll3wt9gly9n7yraq4sph4kgh",
+            ],
+            ...overrides,
+          ]),
+        );
+
+      it("carries spamThreshold from Config into built queries", async () => {
+        const { client, queries } = createCapturingClient();
+        const relay = new OpenSearchRelay(client as unknown as Client, {
+          ...OpenSearchRelay.optionsFromConfig(
+            configWith(["SPAM_THRESHOLD", String(SPAM_THRESHOLD)]),
+          ),
+        });
+
+        await relay.query([{ kinds: [1] } as never]);
+
+        assert.ok(excludesSpam(queries));
+      });
+
+      it("defaults to filtering when SPAM_THRESHOLD is unset", async () => {
+        // Config defaults to 0.99, but the relay constructor defaults to 0.
+        // Going through optionsFromConfig must yield the former.
+        const { client, queries } = createCapturingClient();
+        const relay = new OpenSearchRelay(client as unknown as Client, {
+          ...OpenSearchRelay.optionsFromConfig(configWith()),
+        });
+
+        await relay.query([{ kinds: [1] } as never]);
+
+        assert.ok(excludesSpam(queries));
+      });
+
+      it("carries the rest of the config-derived options too", () => {
+        const options = OpenSearchRelay.optionsFromConfig(
+          configWith(
+            ["OPENSEARCH_INDEX", "custom-index"],
+            ["SPAM_THRESHOLD", "0.8"],
+            ["NSFW_HASHTAGS", "lewd,nsfw"],
+            ["AUTH_KINDS", "4,1059"],
+          ),
+        );
+
+        assert.equal(options.indexName, "custom-index");
+        assert.equal(options.spamThreshold, 0.8);
+        assert.deepEqual(options.nsfwHashtags, new Set(["lewd", "nsfw"]));
+        assert.deepEqual(options.authKinds, new Set([4, 1059]));
+      });
+    });
+
     describe("indexing", () => {
       it("stores the analyzer's raw score", () => {
         const event = finalizeEvent(

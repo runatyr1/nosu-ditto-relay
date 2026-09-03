@@ -674,6 +674,43 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
   }
 
   /**
+   * Every constructor option derived from {@link Config}, in one place.
+   *
+   * Each entry point builds its own instance rather than calling
+   * {@link fromConfig}, because they differ in *client* wiring: the protocol
+   * workers are read-only, the indexer owns the write client, the background
+   * worker holds both. Only the client half legitimately varies, so spreading
+   * this keeps the config half from drifting between them.
+   *
+   * That drift is not hypothetical — the protocol workers once omitted
+   * `spamThreshold` here while still passing it to the analyzer, so replies
+   * were scored on ingest and the score was then never applied to any query.
+   * A call site that needs different behavior should override a field
+   * explicitly, so the deviation is visible.
+   */
+  static optionsFromConfig(config: Config): {
+    indexName: string;
+    historyEnabled: boolean;
+    historyKindsWhitelist: Set<number> | undefined;
+    historyKindsExcluded: Set<number> | undefined;
+    authKinds: Set<number>;
+    tagValueMaxCountPerName: number;
+    nsfwHashtags: ReadonlySet<string>;
+    spamThreshold: number;
+  } {
+    return {
+      indexName: config.opensearchIndex,
+      historyEnabled: config.historyEnabled,
+      historyKindsWhitelist: config.historyKindsWhitelist,
+      historyKindsExcluded: config.historyKindsExcluded,
+      authKinds: config.authKinds,
+      tagValueMaxCountPerName: config.tagValueMaxCountPerName,
+      nsfwHashtags: config.nsfwHashtags,
+      spamThreshold: config.spamThreshold,
+    };
+  }
+
+  /**
    * Create OpenSearchRelay from config
    */
   static fromConfig(config: Config): OpenSearchRelay {
@@ -690,14 +727,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
 
     const client = new OpenSearchClient(clientOptions);
     return new OpenSearchRelay(client, {
-      indexName: config.opensearchIndex,
-      historyEnabled: config.historyEnabled,
-      historyKindsWhitelist: config.historyKindsWhitelist,
-      historyKindsExcluded: config.historyKindsExcluded,
-      authKinds: config.authKinds,
-      tagValueMaxCountPerName: config.tagValueMaxCountPerName,
-      nsfwHashtags: config.nsfwHashtags,
-      spamThreshold: config.spamThreshold,
+      ...OpenSearchRelay.optionsFromConfig(config),
       logger: new Logger(config.logLevel),
     });
   }

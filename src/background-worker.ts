@@ -67,13 +67,14 @@ const readClient = new OpenSearchClient(clientOptions);
 const writeClient = new OpenSearchClient(clientOptions);
 
 const relay = new OpenSearchRelay(readClient, {
-  indexName: config.opensearchIndex,
-  historyEnabled: config.historyEnabled,
-  historyKindsWhitelist: config.historyKindsWhitelist,
-  historyKindsExcluded: config.historyKindsExcluded,
-  authKinds: config.authKinds,
+  ...OpenSearchRelay.optionsFromConfig(config),
   writeClient,
-  tagValueMaxCountPerName: config.tagValueMaxCountPerName,
+  // Score recomputation and trend aggregation must see what is *stored*,
+  // not what discovery-shaped queries are willing to show — same reason
+  // `queryItems` and `remove` opt out. Whether a spam-flagged reply should
+  // count toward its parent's engagement is a separate question from
+  // whether it should be served; keep this reading everything.
+  spamThreshold: 0,
   logger: log,
 });
 
