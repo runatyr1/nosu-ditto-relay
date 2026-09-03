@@ -78,7 +78,8 @@ the hot path.
 │   ├── opensearch.test.ts  # OpenSearch tests
 │   ├── config.ts           # Configuration management
 │   ├── config.test.ts      # Configuration tests
-│   ├── analyze.ts          # Shared analyzer: verify, language, sentiment, media
+│   ├── analyze.ts          # Shared analyzer: verify, language, sentiment, media, spam
+│   ├── analyze.test.ts     # Analyzer tests (spam-scoring scope)
 │   ├── background-worker.ts # Stats/NIP-85/trends worker
 │   ├── log.ts              # Structured JSON logging (one-line entries, Loki-queryable)
 │   ├── log.test.ts         # Logging tests
@@ -95,6 +96,15 @@ the hot path.
 │   ├── nip85.test.ts       # NIP-85 tests
 │   ├── nsfw.ts             # NSFW classification (media + NSFW hashtag) for NIP-50 nsfw:
 │   ├── nsfw.test.ts        # NSFW classification tests
+│   ├── nspam/              # Reply-spam classifier (barrydeen/nspam v2.4, MIT)
+│   │   ├── index.ts        # NSpamClassifier, isScorable, content cap
+│   │   ├── features.ts     # Hashed char/word n-grams + structural features
+│   │   ├── preprocess.ts   # NFKC, invisible-char strip, URL/whitespace normalization
+│   │   ├── murmur3.ts      # MurmurHash3 x86_32 (sklearn HashingVectorizer)
+│   │   ├── lightgbm.ts     # Tree walker, packed-model codec, structural validation
+│   │   ├── model.bin       # Packed model (856 KB; regenerate with scripts/pack-nspam.ts)
+│   │   ├── fixtures/       # Upstream hash + parity fixtures, used as the port's oracle
+│   │   └── nspam.test.ts   # Bit-parity tests against both fixture files
 │   ├── opensearch-client.ts      # Fetch-based OpenSearch client used across src/
 │   ├── opensearch-client.test.ts # OpenSearch client tests
 │   ├── negentropy.ts       # NIP-77 Negentropy protocol codec (set reconciliation)
@@ -115,6 +125,8 @@ the hot path.
 │   ├── backfill-followers.ts      # Aggregate kind 3 p-tags into the followers field on kind 0 docs
 │   ├── backfill-nsfw.ts           # Backfill the nsfw field for pre-existing events
 │   ├── backfill-scores.ts         # Recompute engagement/zap/quote score fields from tags_map.e
+│   ├── backfill-spam.ts           # Score pre-existing replies with nspam (needs the model, not Painless)
+│   ├── pack-nspam.ts              # Repack upstream nspam model.txt + calibration.npz into model.bin
 │   ├── delete-events.ts           # Delete events matching a NIP-01 filter
 │   ├── delete-expired-events.ts   # Delete expired events (NIP-40)
 │   ├── export.ts                  # Export events from the index
@@ -195,6 +207,41 @@ Edit `.env` to configure the application:
   them with `nsfw: true`. Uses the same classification as `NSFW_HASHTAGS`,
   so an empty hashtag set rejects nothing. Only affects new ingests —
   already-indexed NSFW events stay put. Default: `false`.
+- `SPAM_THRESHOLD` - Raw nspam score in `[0, 1]` at or above which a kind 1
+  reply is hidden. Scoring runs inline in the protocol workers
+  (`analyze.ts` step 6), gated by `isScorable` to kind 1 replies (an `e` tag,
+  no `q` tag) and all kind 1111 comments. Kind 1111 needs neither check: the
+  kind is itself the reply marker, its root scope is often an address or a
+  URL rather than an event id, and per NIP-22 a `q` tag on a comment is a
+  citation rather than a quote-post. The model is trained on kind 1 replies
+  only, so 1111 is an extrapolation — same content shape, but NIP-22's
+  uppercase root tags inflate the `tag_other_count` feature. The score is
+  stored per-event in `spam_score` and the threshold is applied at *query*
+  time, so it can be retuned with a restart rather than a reindex.
+
+  Exclusion covers discovery-shaped filters only: anything not naming `ids`
+  or `authors`, including `#e` thread views and `#p` notifications. Three
+  internal read paths opt out explicitly in `buildQuery` — `remove` (spam
+  must stay deletable), `queryIdsBatch`, and `queryItems` (NIP-77 sync must
+  reflect what is stored, or peers re-offer forever). The NIP-50
+  `include:spam` token opts out per query.
+
+  **Stored value is the model's raw score, not its calibrated one.** The
+  calibration table has four knots and clips ~92% of real notes to exactly 0
+  or 1, so thresholding the calibrated score is not meaningfully tunable —
+  0.7 and 0.9 differed by 2 notes in 612. See `SpamScore` in
+  `nspam/index.ts`.
+
+  **Filtering is stored-query only.** Live post-EOSE broadcast is not
+  filtered: `broadcastOne` matches raw `NostrEvent`s and the worker fan-out
+  is a bare `JSON.stringify(event)`, so the score does not cross that seam.
+  A client with an open subscription still receives flagged replies live.
+
+  A document with no `spam_score` is *unscored*, not clean — a `range` query
+  never matches a missing field, so pre-backfill events and non-replies are
+  always returned. Run `scripts/backfill-spam.ts` on an existing index.
+  `0` disables everything (no model load, no scoring, no query clause).
+  Default: `0.99`.
 - `WOT_SEED_PUBKEYS` - Comma-separated hex pubkeys seeding the engagement
   web of trust. The background worker expands them 2 follow-hops via kind 3
   contact lists in the local index (hourly); while the set is available,

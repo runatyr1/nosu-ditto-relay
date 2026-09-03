@@ -162,6 +162,26 @@ export class Config {
    */
   readonly rejectNsfw: boolean;
   /**
+   * Raw nspam score at or above which a reply is treated as spam. Applies
+   * to kind 1 replies and kind 1111 comments (NIP-22).
+   *
+   * Scored events carry the model's *raw* (pre-calibration) score in
+   * `spam_score`; the model's calibrated output clips to 0/1 for ~92% of
+   * real notes and has no usable range to threshold against (see
+   * `SpamScore` in nspam/index.ts). Filtering is applied at query time, so
+   * this can be retuned with a restart — no reindex.
+   *
+   * Only discovery-shaped filters are affected: a filter naming `ids` or
+   * `authors`, or carrying the NIP-50 `include:spam` token, always sees
+   * flagged events.
+   *
+   * `0` disables the feature entirely — no model is loaded, nothing is
+   * scored, and no query clause is added.
+   *
+   * Default: 0.99.
+   */
+  readonly spamThreshold: number;
+  /**
    * Set of kind numbers that are rejected at ingestion regardless of any
    * other policy. Events matching these kinds get an `OK: false` reply with
    * a `blocked:` message and are never stored. Comma-separated.
@@ -512,6 +532,18 @@ export class Config {
     const rejectNsfwValue = env.get("REJECT_NSFW");
     this.rejectNsfw =
       rejectNsfwValue?.toLowerCase() === "true" || rejectNsfwValue === "1";
+
+    // spamThreshold
+    const spamThresholdValue = env.get("SPAM_THRESHOLD");
+    if (spamThresholdValue === undefined || spamThresholdValue === "") {
+      this.spamThreshold = 0.99;
+    } else {
+      const parsed = Number(spamThresholdValue);
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+        throw new Error("SPAM_THRESHOLD must be a number between 0 and 1.");
+      }
+      this.spamThreshold = parsed;
+    }
 
     // rejectedKinds
     const rejectedKindsValue = env.get("REJECTED_KINDS");

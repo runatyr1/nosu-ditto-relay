@@ -28,6 +28,7 @@ import { Config } from "./config.ts";
 import { IndexerClient } from "./indexer-client.ts";
 import { errFields, Logger } from "./log.ts";
 import { register, startRuntimeMetrics } from "./metrics.ts";
+import { createSpamClassifier } from "./nspam/index.ts";
 import { OpenSearchRelay } from "./opensearch.ts";
 import type { ClientOptions } from "./opensearch-client.ts";
 import { Client as OpenSearchClient } from "./opensearch-client.ts";
@@ -103,7 +104,17 @@ const storage: AnalyzableRelay & SyncableStorage = {
 // this thread. The wasm verify is the dominant cost (~fraction of a ms) and
 // is sharded across protocol workers, so an EVENT never pays a cross-thread
 // round trip for analysis.
-const analyze = await createAnalyzer({ nsfwHashtags: config.nsfwHashtags });
+// The nspam model is ~856 KB of typed arrays plus a reusable feature buffer,
+// held per worker. Skipped entirely when spam filtering is off.
+const spamClassifier =
+  config.spamThreshold > 0 ? await createSpamClassifier() : undefined;
+
+const analyze = await createAnalyzer({
+  nsfwHashtags: config.nsfwHashtags,
+  ...(spamClassifier && {
+    spam: { classifier: spamClassifier, threshold: config.spamThreshold },
+  }),
+});
 
 // ---------------------------------------------------------------------------
 // Outbound batching: frames and accepted-event fan-out

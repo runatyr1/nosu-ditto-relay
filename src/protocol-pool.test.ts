@@ -24,6 +24,8 @@ describe("ProtocolPool", () => {
   let countSearchRequests: () => number = () => 0;
   /** Reads the mock's _bulk request counter (assigned in before()). */
   let countBulkRequests: () => number = () => 0;
+  /** Documents the workers sent to _bulk, in order. */
+  const indexedDocs: Array<Record<string, unknown>> = [];
 
   function sendFrame(connId: number, frame: string): void {
     let list = frames.get(connId);
@@ -67,7 +69,7 @@ describe("ProtocolPool", () => {
     let bulkRequests = 0;
     mockOpenSearch = serve({
       port: 0,
-      fetch(req) {
+      async fetch(req) {
         const url = new URL(req.url);
         if (url.pathname.includes("_search")) {
           searchRequests++;
@@ -78,6 +80,14 @@ describe("ProtocolPool", () => {
         }
         if (url.pathname.includes("_bulk")) {
           bulkRequests++;
+          // Keep the indexed documents so tests can assert on what the
+          // workers actually wrote, not just that they wrote something.
+          for (const line of (await req.text()).split("\n")) {
+            if (!line.trim()) continue;
+            const parsed = JSON.parse(line);
+            if (parsed.index || parsed.update || parsed.delete) continue;
+            indexedDocs.push(parsed);
+          }
           return Response.json({ took: 1, errors: false, items: [] });
         }
         return Response.json({ acknowledged: true });
@@ -136,6 +146,49 @@ describe("ProtocolPool", () => {
       false,
       "invalid: signature verification failed",
     ]);
+  });
+
+  it("indexes a kind 1 reply with a spam_score", async () => {
+    // End-to-end through a real worker: analyze() scores the reply, relay.ts
+    // hands the score to storage, and eventToDocument writes it. The workers
+    // get no SPAM_THRESHOLD in workerEnv, so they run on the 0.99 default —
+    // which also proves each worker loads the packed model at startup.
+    const event = createEvent({
+      kind: 1,
+      content: "GM nostr:npub1qqqqq pura vida!",
+      tags: [
+        ["e", "a".repeat(64), "", "root"],
+        ["p", "b".repeat(64)],
+      ],
+    });
+    const before = indexedDocs.length;
+    pool.open(120);
+    pool.message(120, JSON.stringify(["EVENT", event]));
+    await until(() => indexedDocs.length > before);
+
+    const doc = indexedDocs.find((d) => d.id === event.id);
+    assert.ok(doc, "reply should have been indexed");
+    assert.equal(typeof doc.spam_score, "number");
+    const score = doc.spam_score as number;
+    assert.ok(score >= 0 && score <= 1, `spam_score out of range: ${score}`);
+  });
+
+  it("indexes a kind 1 root note with no spam_score", async () => {
+    // The model only applies to replies, so a root note must carry no field
+    // at all — absent means unscored, and a missing field is never filtered.
+    const event = createEvent({
+      kind: 1,
+      content: "good morning nostr",
+      tags: [],
+    });
+    const before = indexedDocs.length;
+    pool.open(121);
+    pool.message(121, JSON.stringify(["EVENT", event]));
+    await until(() => indexedDocs.length > before);
+
+    const doc = indexedDocs.find((d) => d.id === event.id);
+    assert.ok(doc, "root note should have been indexed");
+    assert.ok(!("spam_score" in doc), "root notes must not be scored");
   });
 
   it("delivers accepted events across workers (fan-out broadcast)", async () => {

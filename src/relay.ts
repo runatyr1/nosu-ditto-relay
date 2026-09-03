@@ -96,6 +96,7 @@ export interface EventAnalysis {
   media?: boolean;
   video?: boolean;
   nsfw?: boolean;
+  spam_score?: number;
 }
 
 /**
@@ -967,6 +968,7 @@ export class Relay {
           media: analysis.media,
           video: analysis.video,
           nsfw: analysis.nsfw,
+          spam_score: analysis.spam_score,
         },
       };
       await this.storage.event(event, eventOpts);

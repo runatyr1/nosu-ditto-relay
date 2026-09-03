@@ -15,7 +15,12 @@ import { detect as detectLanguage } from "tinyld";
 
 import { buildAutocompleteText } from "./autocomplete-text.ts";
 import { detectMedia } from "./media.ts";
+import {
+  relaySpamClassifiedCounter,
+  relaySpamScoreHistogram,
+} from "./metrics.ts";
 import { DEFAULT_NSFW_HASHTAGS, detectNsfw } from "./nsfw.ts";
+import { isScorable, type NSpamClassifier } from "./nspam/index.ts";
 import { buildSearchText } from "./search-text.ts";
 
 /** Result of analyzing a Nostr event. */
@@ -28,6 +33,12 @@ export interface AnalyzeResult {
   media?: boolean;
   video?: boolean;
   nsfw?: boolean;
+  /**
+   * Raw nspam score for kind 1 replies and kind 1111 comments (see
+   * nspam/index.ts). Absent for every other event — the model applies to
+   * replies only, so "absent" means "not scored", never "not spam".
+   */
+  spam_score?: number;
 }
 
 /** Synchronous event analyzer produced by {@link createAnalyzer}. */
@@ -397,8 +408,19 @@ function detectEventSentiment(
 export async function createAnalyzer(opts?: {
   /** Lowercase NSFW hashtag set (see nsfw.ts). Empty set disables. */
   nsfwHashtags?: ReadonlySet<string>;
+  /**
+   * Loaded nspam classifier and the threshold it is scored against. Omit to
+   * skip spam scoring entirely — callers pass this only when
+   * `SPAM_THRESHOLD` is non-zero.
+   *
+   * The threshold is used solely to label the metrics; the score itself is
+   * stored raw and the filtering decision belongs to the storage layer.
+   * Bundled with the classifier so the two cannot fall out of step.
+   */
+  spam?: { classifier: NSpamClassifier; threshold: number };
 }): Promise<Analyzer> {
   const nsfwHashtags = opts?.nsfwHashtags ?? DEFAULT_NSFW_HASHTAGS;
+  const spam = opts?.spam;
   const nw = await initNostrWasm();
 
   detectLanguage("warmup text for language detection");
@@ -457,6 +479,21 @@ export async function createAnalyzer(opts?: {
     // Step 5: NSFW classification — media attachment + NSFW hashtag
     // (see nsfw.ts). Queried by the NIP-50 `nsfw:false` extension.
     if (detectNsfw(nostrEvent, media, nsfwHashtags)) out.nsfw = true;
+
+    // Step 6: nspam reply-spam score. Gated by `isScorable` to kind 1 replies
+    // and kind 1111 comments — the reply-shaped kinds. Scored as a group of
+    // one, which is a trained group size but the model's weakest; see
+    // nspam/index.ts.
+    if (spam && isScorable(nostrEvent)) {
+      const score = spam.classifier.score([nostrEvent]);
+      if (score) {
+        out.spam_score = score.raw;
+        relaySpamScoreHistogram.observe(score.raw);
+        relaySpamClassifiedCounter.inc({
+          spam: String(score.raw >= spam.threshold),
+        });
+      }
+    }
 
     return out;
   };

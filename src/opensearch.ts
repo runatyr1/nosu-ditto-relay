@@ -270,6 +270,19 @@ interface NostrEventDocument extends NostrEvent {
    */
   nsfw: boolean;
   /**
+   * Raw nspam reply-spam score in [0, 1], set only on kind 1 replies and
+   * kind 1111 comments (see nspam/index.ts). Discovery-shaped queries
+   * exclude documents at or above
+   * `SPAM_THRESHOLD` unless the NIP-50 `include:spam` token is given.
+   *
+   * Absent means "never scored" — a non-reply, an event indexed before the
+   * feature existed, or an ingest with spam filtering disabled. A `range`
+   * query does not match documents missing the field, so unscored events are
+   * always returned. That is what lets the backfill run incrementally
+   * without hiding anything in the meantime.
+   */
+  spam_score?: number;
+  /**
    * NIP-13 proof-of-work difficulty: the number of leading zero bits in the
    * event `id`, clamped to any committed target in the `nonce` tag. Events
    * without a `nonce` tag are stored with `pow: 0`. Queried by the NIP-50
@@ -580,6 +593,8 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
 
   /** Lowercase NSFW hashtag set used by the ingest fallback (see nsfw.ts). */
   private nsfwHashtags: ReadonlySet<string>;
+  /** Raw nspam score at or above which documents are hidden; 0 = disabled. */
+  private spamThreshold: number;
 
   /**
    * Maximum number of events permitted to sit in the bulk queue. When
@@ -626,6 +641,12 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
        */
       nsfwHashtags?: ReadonlySet<string>;
       /**
+       * Raw nspam score at or above which a document is excluded from
+       * discovery-shaped queries (see `Config.spamThreshold`). `0` disables
+       * the exclusion entirely. Defaults to 0.
+       */
+      spamThreshold?: number;
+      /**
        * Structured logger. Defaults to a fresh `info`-level Logger; entry
        * points inject one built from `Config.logLevel`.
        */
@@ -649,6 +670,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       opts?.tagValueMaxCountPerName ??
       OpenSearchRelay.TAG_VALUE_MAX_COUNT_PER_NAME;
     this.nsfwHashtags = opts?.nsfwHashtags ?? DEFAULT_NSFW_HASHTAGS;
+    this.spamThreshold = opts?.spamThreshold ?? 0;
   }
 
   /**
@@ -675,6 +697,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       authKinds: config.authKinds,
       tagValueMaxCountPerName: config.tagValueMaxCountPerName,
       nsfwHashtags: config.nsfwHashtags,
+      spamThreshold: config.spamThreshold,
       logger: new Logger(config.logLevel),
     });
   }
@@ -906,6 +929,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       media?: boolean;
       video?: boolean;
       nsfw?: boolean;
+      spam_score?: number;
     },
   ): NostrEventDocument {
     const tagsMap = this.buildTagsMap(event.tags, event.kind);
@@ -978,6 +1002,12 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       media: mediaResult.media ?? false,
       video: mediaResult.video ?? false,
       nsfw,
+      // Only the analyzer produces this — there is no local fallback, since
+      // the indexer holds no model. Omitted rather than defaulted, so an
+      // unscored event is distinguishable from one scored as clean.
+      ...(analysis?.spam_score !== undefined && {
+        spam_score: analysis.spam_score,
+      }),
       pow: getPow(event),
       followers: 0,
       engagers: 0,
@@ -988,6 +1018,39 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       zap_amount_msats: 0,
       zap_cnt: 0,
     };
+  }
+
+  /**
+   * Whether spam-flagged documents should be hidden from this filter.
+   *
+   * Only *discovery*-shaped filters are cleaned up. A filter that names
+   * `ids` or `authors` is asking for specific events or a specific person's
+   * posts, and the caller is entitled to get them — hiding a reply from its
+   * own author's timeline, or from a direct id lookup, would be surprising
+   * and would break clients that fetch an event they just published.
+   *
+   * Everything else is filtered, including `#e` (thread views) and `#p`
+   * (notifications). Those are the two places reply spam actually
+   * concentrates, so exempting them would defeat the feature.
+   *
+   * The NIP-50 `include:spam` extension opts out per query.
+   */
+  private shouldExcludeSpam(filter: NostrFilter): boolean {
+    if (this.spamThreshold <= 0) return false;
+    if (filter.ids && filter.ids.length > 0) return false;
+    if (filter.authors && filter.authors.length > 0) return false;
+    if (filter.search) {
+      for (const token of NIP50.parseInput(filter.search)) {
+        if (
+          typeof token === "object" &&
+          token.key === "include" &&
+          token.value === "spam"
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   /**
@@ -1650,6 +1713,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       includeReplaced?: boolean;
       includeAuthKinds?: boolean;
       includeExpired?: boolean;
+      includeSpam?: boolean;
     },
   ): BoolQuery {
     const must: Record<string, unknown>[] = [
@@ -1700,6 +1764,17 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       // When specific IDs are requested, skip exclusion — the relay layer handles auth.
       // Master-authed connections pass `includeAuthKinds` to opt out entirely.
       mustNot.push({ terms: { kind: [...this.authKinds] } });
+    }
+
+    // Spam exclusion (nspam). Applied here rather than inside the
+    // `filter.search` block below because it has to reach filters with no
+    // search term at all — a bare `{kinds: [1]}` global feed is exactly the
+    // shape this is meant to clean up.
+    //
+    // NIP-50 only asks relays to exclude spam from *search* results; applying
+    // it to every discovery-shaped filter is a deliberate superset.
+    if (!opts?.includeSpam && this.shouldExcludeSpam(filter)) {
+      mustNot.push({ range: { spam_score: { gte: this.spamThreshold } } });
     }
 
     // Time range filters (clamp to safe range for OpenSearch long type)
@@ -2033,6 +2108,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         media?: boolean;
         video?: boolean;
         nsfw?: boolean;
+        spam_score?: number;
       };
     },
   ): Promise<void> {
@@ -2340,6 +2416,9 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
           includeReplaced: true,
           includeAuthKinds: true,
           includeExpired: true,
+          // Resolving ids for import must see every stored version,
+          // spam-flagged or not.
+          includeSpam: true,
         }),
         size,
         _source: ["id"],
@@ -3089,6 +3168,10 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     const order = limit === undefined ? ("asc" as const) : ("desc" as const);
     const query = this.buildQuery(filter, {
       includeAuthKinds: opts?.includeAuthKinds,
+      // NIP-77 reconciliation must reflect what is actually stored. Hiding
+      // spam here would make us claim not to have events we do have, and the
+      // peer would re-offer them on every sync, forever.
+      includeSpam: true,
     });
     const items: SyncItem[] = [];
 
@@ -3320,6 +3403,9 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
             includeReplaced: !limited,
             includeAuthKinds: true,
             includeExpired: true,
+            // A spam-flagged note must stay deletable — kind 5 and kind 62
+            // have to reach it.
+            includeSpam: true,
           }),
         ],
       };
@@ -3430,6 +3516,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     media: { type: "boolean" },
     video: { type: "boolean" },
     nsfw: { type: "boolean" },
+    spam_score: { type: "float" },
     pow: { type: "integer" },
     followers: { type: "integer" },
     engagers: { type: "integer" },

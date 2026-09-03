@@ -9557,4 +9557,256 @@ describe("OpenSearchRelay.seedDirtyEngaged", () => {
     );
     assert.ok(must.some((c) => JSON.stringify(c).includes("created_at")));
   });
+
+  describe("spam filtering (nspam)", () => {
+    const SPAM_THRESHOLD = 0.99;
+
+    /**
+     * Captures every query the relay builds, so the tests can assert on the
+     * *policy* — which filter shapes get the exclusion clause — rather than
+     * simulating document matching.
+     */
+    const createCapturingClient = () => {
+      const queries: Array<Record<string, unknown>> = [];
+
+      const record = (body: Record<string, unknown> | undefined) => {
+        if (body?.query) queries.push(body.query as Record<string, unknown>);
+      };
+
+      const client = {
+        search: async ({ body }: { body: Record<string, unknown> }) => {
+          record(body);
+          return { body: { hits: { hits: [] } } };
+        },
+        msearch: async (requests: Array<{ body: Record<string, unknown> }>) => {
+          for (const request of requests) record(request.body);
+          return {
+            body: { responses: requests.map(() => ({ hits: { hits: [] } })) },
+          };
+        },
+        deleteByQuery: async ({ body }: { body: Record<string, unknown> }) => {
+          record(body);
+          return { body: { deleted: 0 } };
+        },
+        updateByQuery: async ({ body }: { body: Record<string, unknown> }) => {
+          record(body);
+          return { body: { updated: 0 } };
+        },
+        count: async ({ body }: { body: Record<string, unknown> }) => {
+          record(body);
+          return { body: { count: 0 } };
+        },
+        bulk: async () => ({ body: { errors: false, items: [] } }),
+        indices: {
+          exists: async () => ({ body: true }),
+          refresh: async () => ({ body: {} }),
+        },
+      };
+
+      return { client, queries };
+    };
+
+    /** Does any query built during the call carry the spam exclusion? */
+    const excludesSpam = (queries: Array<Record<string, unknown>>): boolean =>
+      queries.some((query) =>
+        JSON.stringify(query).includes(
+          `{"range":{"spam_score":{"gte":${SPAM_THRESHOLD}}}}`,
+        ),
+      );
+
+    const setup = (threshold = SPAM_THRESHOLD) => {
+      const { client, queries } = createCapturingClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        spamThreshold: threshold,
+      });
+      return { relay, queries };
+    };
+
+    const ID = "a".repeat(64);
+    const PUBKEY = "b".repeat(64);
+
+    describe("discovery-shaped filters are cleaned up", () => {
+      const discoveryFilters: Array<[string, Record<string, unknown>]> = [
+        ["kind-only global feed", { kinds: [1] }],
+        ["catch-all", {}],
+        ["thread view (#e)", { kinds: [1], "#e": [ID] }],
+        ["notifications (#p)", { kinds: [1], "#p": [PUBKEY] }],
+        ["hashtag feed (#t)", { kinds: [1], "#t": ["nostr"] }],
+        ["full-text search", { kinds: [1], search: "bitcoin" }],
+        ["search with another extension", { search: "nsfw:false" }],
+      ];
+
+      for (const [name, filter] of discoveryFilters) {
+        it(`excludes spam from a ${name}`, async () => {
+          const { relay, queries } = setup();
+          await relay.query([filter as never]);
+          assert.ok(excludesSpam(queries), `${name} should exclude spam`);
+        });
+      }
+    });
+
+    describe("targeted filters still see everything", () => {
+      // Asking for a specific event, or for a specific person's posts, is not
+      // discovery. Hiding a reply from its own author's timeline would break
+      // clients fetching an event they just published.
+      const targetedFilters: Array<[string, Record<string, unknown>]> = [
+        ["direct id lookup", { ids: [ID] }],
+        ["author timeline", { authors: [PUBKEY] }],
+        ["author + kind", { kinds: [1], authors: [PUBKEY] }],
+        ["author thread view", { authors: [PUBKEY], "#e": [ID] }],
+      ];
+
+      for (const [name, filter] of targetedFilters) {
+        it(`includes spam in a ${name}`, async () => {
+          const { relay, queries } = setup();
+          await relay.query([filter as never]);
+          assert.ok(!excludesSpam(queries), `${name} should include spam`);
+        });
+      }
+
+      it("ignores empty ids/authors arrays", async () => {
+        // An empty array names nobody, so it is not a targeted filter.
+        const { relay, queries } = setup();
+        await relay.query([{ kinds: [1], ids: [], authors: [] } as never]);
+        assert.ok(excludesSpam(queries));
+      });
+    });
+
+    describe("NIP-50 include:spam", () => {
+      it("opts out of the exclusion", async () => {
+        const { relay, queries } = setup();
+        await relay.query([{ kinds: [1], search: "include:spam" } as never]);
+        assert.ok(!excludesSpam(queries));
+      });
+
+      it("works alongside a text query", async () => {
+        const { relay, queries } = setup();
+        await relay.query([
+          { kinds: [1], search: "bitcoin include:spam" } as never,
+        ]);
+        assert.ok(!excludesSpam(queries));
+      });
+
+      it("does not opt out for an unrelated include: value", async () => {
+        const { relay, queries } = setup();
+        await relay.query([
+          { kinds: [1], search: "include:nonsense" } as never,
+        ]);
+        assert.ok(excludesSpam(queries));
+      });
+    });
+
+    describe("COUNT", () => {
+      it("applies the same policy as REQ", async () => {
+        const { relay, queries } = setup();
+        await relay.count([{ kinds: [1] } as never]);
+        assert.ok(excludesSpam(queries));
+      });
+
+      it("counts everything for a targeted filter", async () => {
+        const { relay, queries } = setup();
+        await relay.count([{ authors: [PUBKEY] } as never]);
+        assert.ok(!excludesSpam(queries));
+      });
+    });
+
+    describe("internal read paths are never filtered", () => {
+      // Each of these would break in a different way if spam were hidden from
+      // it, so they opt out explicitly in buildQuery.
+
+      it("remove() reaches spam-flagged events", async () => {
+        // A spam-flagged note must still be deletable by kind 5 / kind 62.
+        const { relay, queries } = setup();
+        await relay.remove([{ kinds: [1], "#e": [ID] } as never]);
+        assert.ok(queries.length > 0);
+        assert.ok(!excludesSpam(queries));
+      });
+
+      it("queryIdsBatch() reaches spam-flagged events", async () => {
+        const { relay, queries } = setup();
+        await relay.queryIdsBatch([{ kinds: [1] } as never]);
+        assert.ok(queries.length > 0);
+        assert.ok(!excludesSpam(queries));
+      });
+
+      it("queryItems() (NIP-77 sync) reaches spam-flagged events", async () => {
+        // NIP-77 reconciliation must reflect what is stored, or peers re-offer
+        // the same events on every sync forever.
+        const { relay, queries } = setup();
+        await relay.queryItems({ kinds: [1] } as never);
+        assert.ok(queries.length > 0);
+        assert.ok(!excludesSpam(queries));
+      });
+    });
+
+    describe("SPAM_THRESHOLD = 0", () => {
+      it("adds no clause at all", async () => {
+        const { relay, queries } = setup(0);
+        await relay.query([{ kinds: [1] } as never]);
+        assert.ok(queries.length > 0);
+        assert.ok(!JSON.stringify(queries).includes("spam_score"));
+      });
+    });
+
+    describe("threshold value", () => {
+      it("uses the configured threshold in the range clause", async () => {
+        const { relay, queries } = setup(0.5);
+        await relay.query([{ kinds: [1] } as never]);
+        assert.ok(
+          JSON.stringify(queries).includes(
+            '{"range":{"spam_score":{"gte":0.5}}}',
+          ),
+        );
+      });
+    });
+
+    describe("indexing", () => {
+      it("stores the analyzer's raw score", () => {
+        const event = finalizeEvent(
+          {
+            kind: 1,
+            content: "sure",
+            tags: [["e", ID]],
+            created_at: Math.floor(Date.now() / 1000),
+          },
+          generateSecretKey(),
+        );
+        const { relay } = setup();
+        const doc = (
+          relay as unknown as {
+            eventToDocument: (
+              e: NostrEvent,
+              a?: Record<string, unknown>,
+            ) => Record<string, unknown>;
+          }
+        ).eventToDocument(event, { spam_score: 0.875 });
+        assert.equal(doc.spam_score, 0.875);
+      });
+
+      it("omits the field entirely when nothing scored the event", () => {
+        // Absent must mean "unscored", not "clean" — a range query does not
+        // match documents missing the field, so unscored events stay visible.
+        const event = finalizeEvent(
+          {
+            kind: 1,
+            content: "a root note",
+            tags: [],
+            created_at: Math.floor(Date.now() / 1000),
+          },
+          generateSecretKey(),
+        );
+        const { relay } = setup();
+        const doc = (
+          relay as unknown as {
+            eventToDocument: (
+              e: NostrEvent,
+              a?: Record<string, unknown>,
+            ) => Record<string, unknown>;
+          }
+        ).eventToDocument(event, {});
+        assert.ok(!("spam_score" in doc));
+      });
+    });
+  });
 });

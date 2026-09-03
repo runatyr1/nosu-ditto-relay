@@ -177,6 +177,15 @@ The following NIP-50 search extensions are supported:
 - `nsfw:false` — Exclude NSFW events (a media attachment plus an NSFW hashtag,
   see `NSFW_HASHTAGS`). NSFW events are included by default per NIP-50;
   `nsfw:true` is accepted as a no-op.
+- `include:spam` — Disable spam filtering for this query. Kind 1 replies and
+  kind 1111 comments (NIP-22) are scored by an on-device classifier (see
+  `SPAM_THRESHOLD`) and flagged ones are
+  hidden by default from *discovery-shaped* filters — anything that does not
+  name `ids` or `authors`, including thread (`#e`) and notification (`#p`)
+  views, which is where reply spam concentrates. Filters naming `ids` or
+  `authors` always see everything, so fetching a specific event or reading an
+  author's own timeline is never affected. Note this goes beyond NIP-50, which
+  asks only that search results exclude spam.
 - `pow:<n>` — Filter by NIP-13 proof-of-work difficulty: matches events whose
   `id` has at least `n` leading zero bits, clamped to the committed target in
   the `nonce` tag. Events without a `nonce` tag have `pow:0`, e.g. `pow:20`.
@@ -250,6 +259,7 @@ All options:
 | `BANNED_HASHTAGS` | `t` tag values rejected at ingestion | unset |
 | `NSFW_HASHTAGS` | `t` tag values that mark events with media as NSFW (`nsfw:false` excludes them; empty disables) | `nsfw,porn,...` |
 | `REJECT_NSFW` | Reject NSFW events at ingestion instead of indexing them | `false` |
+| `SPAM_THRESHOLD` | Raw nspam score at or above which a reply (kind 1 or 1111) is hidden from discovery queries (`0` disables scoring entirely) | `0.99` |
 | `RELAY_MAX_MESSAGE_LENGTH` | Max inbound message size (bytes) | `4000000` |
 | `RELAY_MAX_FILTER_VALUES` | Max entries per filter array field | `20000` |
 | `RELAY_TAG_VALUE_MAX_COUNT_PER_NAME` | Max indexed values per tag name | `5000` |

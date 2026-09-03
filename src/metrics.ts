@@ -366,6 +366,30 @@ export const relayConnectionsGauge = new Gauge({
   help: "Active relay connections",
 });
 
+/**
+ * Events scored by the nspam classifier, split by whether the score met
+ * `SPAM_THRESHOLD`. Only reply-shaped kinds are scored (1 and 1111), so this
+ * counts a subset of `ditto_relay_events_total`.
+ */
+export const relaySpamClassifiedCounter = new Counter({
+  name: "ditto_relay_spam_classified_total",
+  help: "Replies (kind 1/1111) scored by the nspam classifier",
+  labelNames: ["spam"] as const,
+});
+
+/**
+ * Distribution of raw nspam scores.
+ *
+ * The model is bimodal — most notes land hard against 0 or 1 — so the
+ * buckets are clustered at the ends where the threshold actually sits rather
+ * than spread evenly.
+ */
+export const relaySpamScoreHistogram = new Histogram({
+  name: "ditto_relay_spam_score",
+  help: "Raw nspam score of scored replies",
+  buckets: [0.001, 0.01, 0.1, 0.5, 0.9, 0.99, 0.999],
+});
+
 /** Active NIP-77 Negentropy sync sessions across all connections. */
 export const relayNegentropySessionsGauge = new Gauge({
   name: "ditto_relay_negentropy_sessions",

@@ -332,6 +332,55 @@ describe("Config", () => {
     });
   });
 
+  describe("spamThreshold", () => {
+    it("should default to 0.99", () => {
+      const config = new Config(baseEnv());
+      assert.equal(config.spamThreshold, 0.99);
+    });
+
+    it("should parse an explicit threshold", () => {
+      const config = new Config(baseEnv([["SPAM_THRESHOLD", "0.5"]]));
+      assert.equal(config.spamThreshold, 0.5);
+    });
+
+    it("should treat 0 as disabled", () => {
+      const config = new Config(baseEnv([["SPAM_THRESHOLD", "0"]]));
+      assert.equal(config.spamThreshold, 0);
+    });
+
+    it("should accept the endpoints", () => {
+      assert.equal(
+        new Config(baseEnv([["SPAM_THRESHOLD", "1"]])).spamThreshold,
+        1,
+      );
+    });
+
+    it("should fall back to the default for an empty string", () => {
+      const config = new Config(baseEnv([["SPAM_THRESHOLD", ""]]));
+      assert.equal(config.spamThreshold, 0.99);
+    });
+
+    it("should throw on a value outside [0, 1]", () => {
+      for (const value of ["-0.1", "1.5", "42"]) {
+        assert.throws(
+          () => new Config(baseEnv([["SPAM_THRESHOLD", value]])),
+          /SPAM_THRESHOLD/,
+          `expected ${value} to be rejected`,
+        );
+      }
+    });
+
+    it("should throw on a non-numeric value", () => {
+      for (const value of ["high", "NaN", "Infinity"]) {
+        assert.throws(
+          () => new Config(baseEnv([["SPAM_THRESHOLD", value]])),
+          /SPAM_THRESHOLD/,
+          `expected ${value} to be rejected`,
+        );
+      }
+    });
+  });
+
   describe("wotSeedPubkeys", () => {
     const hex =
       "4b1b7f0d17e5ee24ccd091afacfe7923329c21387f1f3ee14c3cf3fa31e2a813";
