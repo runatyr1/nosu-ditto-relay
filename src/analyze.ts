@@ -15,6 +15,7 @@ import { detect as detectLanguage } from "tinyld";
 
 import { buildAutocompleteText } from "./autocomplete-text.ts";
 import { detectMedia } from "./media.ts";
+import { DEFAULT_NSFW_HASHTAGS, detectNsfw } from "./nsfw.ts";
 import { buildSearchText } from "./search-text.ts";
 
 /** Result of analyzing a Nostr event. */
@@ -26,6 +27,7 @@ export interface AnalyzeResult {
   sentiment?: string;
   media?: boolean;
   video?: boolean;
+  nsfw?: boolean;
 }
 
 /** Synchronous event analyzer produced by {@link createAnalyzer}. */
@@ -392,7 +394,11 @@ function detectEventSentiment(
  * analyzer (AFINN lexicon), so the first real event doesn't pay lazy-init
  * cost on whatever thread this runs on.
  */
-export async function createAnalyzer(): Promise<Analyzer> {
+export async function createAnalyzer(opts?: {
+  /** Lowercase NSFW hashtag set (see nsfw.ts). Empty set disables. */
+  nsfwHashtags?: ReadonlySet<string>;
+}): Promise<Analyzer> {
+  const nsfwHashtags = opts?.nsfwHashtags ?? DEFAULT_NSFW_HASHTAGS;
   const nw = await initNostrWasm();
 
   detectLanguage("warmup text for language detection");
@@ -447,6 +453,10 @@ export async function createAnalyzer(): Promise<Analyzer> {
     const { media, video } = detectMedia(nostrEvent);
     if (media !== undefined) out.media = media;
     if (video !== undefined) out.video = video;
+
+    // Step 5: NSFW classification — media attachment + NSFW hashtag
+    // (see nsfw.ts). Queried by the NIP-50 `nsfw:false` extension.
+    if (detectNsfw(nostrEvent, media, nsfwHashtags)) out.nsfw = true;
 
     return out;
   };

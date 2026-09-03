@@ -87,10 +87,14 @@ the hot path.
 │   ├── media.ts            # Media/video detection from imeta tags and URLs
 │   ├── media.test.ts       # Media detection tests
 │   ├── errors.ts           # Typed ingest-backpressure errors (StorageOverloaded)
+│   ├── expiration.ts       # NIP-40 expiry check shared by relay and storage
+│   ├── expiration.test.ts  # Expiration tests
 │   ├── landing-page.ts     # HTML landing page served on GET /
 │   ├── landing-page.test.ts # Landing page tests
 │   ├── nip85.ts            # NIP-85 Trusted Assertions publisher (kinds 30382-30385)
 │   ├── nip85.test.ts       # NIP-85 tests
+│   ├── nsfw.ts             # NSFW classification (media + NSFW hashtag) for NIP-50 nsfw:
+│   ├── nsfw.test.ts        # NSFW classification tests
 │   ├── opensearch-client.ts      # Fetch-based OpenSearch client used across src/
 │   ├── opensearch-client.test.ts # OpenSearch client tests
 │   ├── negentropy.ts       # NIP-77 Negentropy protocol codec (set reconciliation)
@@ -109,6 +113,7 @@ the hot path.
 │   ├── analyze-client.ts          # Analyze a client's users (active/inactive, engagement, cohorts)
 │   ├── backfill-client-address.ts # Backfill client field (NIP-89 client address) for existing events
 │   ├── backfill-followers.ts      # Aggregate kind 3 p-tags into the followers field on kind 0 docs
+│   ├── backfill-nsfw.ts           # Backfill the nsfw field for pre-existing events
 │   ├── backfill-scores.ts         # Recompute engagement/zap/quote score fields from tags_map.e
 │   ├── delete-events.ts           # Delete events matching a NIP-01 filter
 │   ├── delete-expired-events.ts   # Delete expired events (NIP-40)
@@ -161,7 +166,8 @@ Edit `.env` to configure the application:
 - `PROTOCOL_WORKERS` - Number of protocol worker threads. Unset = auto
   (`max(1, min(16, floor(cores / 4)))`); must be `>= 1` when set.
 - `AUTH_KINDS` - Comma-separated kinds requiring NIP-42 AUTH for REQ/COUNT and
-  excluded from unscoped queries (default: `4,1059` — DMs and gift wraps).
+  excluded from unscoped queries (default: `4,78,1059,30078` — DMs, gift wraps,
+  and NIP-78 application-specific data).
 - `AUTH_AUTHOR_EXEMPT_KINDS` - Subset of `AUTH_KINDS` served WITHOUT
   authentication to filters naming a non-empty `authors` list (when every
   auth kind in the filter is exempt). For these kinds the author is an
@@ -174,6 +180,21 @@ Edit `.env` to configure the application:
   gating on REQ/COUNT/NEG-OPEN and live subscriptions, including catch-all
   filters.   Intended for operator-controlled services such as bridges and
   notification servers. Default: empty (no master pubkeys).
+- `NSFW_HASHTAGS` - Comma-separated hashtags (lowercased `t` tag values)
+  marking events as NSFW. An event carrying both a media attachment and any
+  of these hashtags is indexed with `nsfw: true`; the NIP-50 `nsfw:false`
+  extension excludes such events from search results (they are included by
+  default per the NIP). Set to an empty string to disable classification.
+  Default: the built-in set in `src/nsfw.ts` (~19 hashtags in broad general
+  use as adult-content markers; tags with common non-adult usage and
+  long-tail compounds are deliberately excluded). Run
+  `scripts/backfill-nsfw.ts` after enabling — or after changing the set — on
+  an existing index.
+- `REJECT_NSFW` - `true`/`1` to reject NSFW events at ingestion (`OK false
+  "blocked: this relay does not accept NSFW content"`) instead of storing
+  them with `nsfw: true`. Uses the same classification as `NSFW_HASHTAGS`,
+  so an empty hashtag set rejects nothing. Only affects new ingests —
+  already-indexed NSFW events stay put. Default: `false`.
 - `WOT_SEED_PUBKEYS` - Comma-separated hex pubkeys seeding the engagement
   web of trust. The background worker expands them 2 follow-hops via kind 3
   contact lists in the local index (hourly); while the set is available,

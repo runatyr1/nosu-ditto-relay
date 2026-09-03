@@ -236,9 +236,9 @@ describe("Config", () => {
   });
 
   describe("authKinds", () => {
-    it("should default to kinds 4 and 1059", () => {
+    it("should default to kinds 4, 78, 1059, and 30078", () => {
       const config = new Config(baseEnv());
-      assert.deepEqual(config.authKinds, new Set([4, 1059]));
+      assert.deepEqual(config.authKinds, new Set([4, 78, 1059, 30078]));
     });
 
     it("should parse comma-separated kind numbers", () => {
@@ -399,6 +399,64 @@ describe("Config", () => {
     it("should return empty set for empty string", () => {
       const config = new Config(baseEnv([["BANNED_HASHTAGS", ""]]));
       assert.deepEqual(config.bannedHashtags, new Set());
+    });
+  });
+
+  describe("nsfwHashtags", () => {
+    it("should default to the built-in NSFW hashtag set when not set", () => {
+      const config = new Config(baseEnv());
+      assert.ok(config.nsfwHashtags.size > 0);
+      assert.ok(config.nsfwHashtags.has("nsfw"));
+      assert.ok(config.nsfwHashtags.has("porn"));
+    });
+
+    it("should parse comma-separated hashtags, lowercased and trimmed", () => {
+      const config = new Config(
+        baseEnv([["NSFW_HASHTAGS", " Lewd , , NSFW "]]),
+      );
+      assert.deepEqual(config.nsfwHashtags, new Set(["lewd", "nsfw"]));
+    });
+
+    it("should disable classification with an explicit empty string", () => {
+      const config = new Config(baseEnv([["NSFW_HASHTAGS", ""]]));
+      assert.deepEqual(config.nsfwHashtags, new Set());
+    });
+  });
+
+  describe("rejectNsfw", () => {
+    it("should default to false", () => {
+      const config = new Config(baseEnv());
+      assert.equal(config.rejectNsfw, false);
+    });
+
+    it("should accept true and 1", () => {
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "true"]])).rejectNsfw,
+        true,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "TRUE"]])).rejectNsfw,
+        true,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "1"]])).rejectNsfw,
+        true,
+      );
+    });
+
+    it("should treat any other value as false", () => {
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "false"]])).rejectNsfw,
+        false,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", "0"]])).rejectNsfw,
+        false,
+      );
+      assert.equal(
+        new Config(baseEnv([["REJECT_NSFW", ""]])).rejectNsfw,
+        false,
+      );
     });
   });
 

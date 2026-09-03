@@ -129,8 +129,8 @@ The relay sends AUTH challenges lazily, only when a client requests something
 that requires authentication. A single connection can authenticate as multiple
 pubkeys; each successful AUTH adds to the set.
 
-Kinds listed in `AUTH_KINDS` (default `4,1059` — NIP-04 DMs and NIP-59 gift
-wraps) are auth-protected:
+Kinds listed in `AUTH_KINDS` (default `4,78,1059,30078` — NIP-04 DMs, NIP-59
+gift wraps, and NIP-78 application-specific data) are auth-protected:
 
 - REQ/COUNT filters requesting an auth-protected kind must include `authors`
   or `#p`, and all entries of at least one of those lists must be
@@ -174,6 +174,9 @@ The following NIP-50 search extensions are supported:
 - `sentiment:<value>` — Filter by sentiment: `positive`, `negative`, `neutral`
 - `media:true` / `media:false` — Filter by presence of media attachments
 - `video:true` / `video:false` — Filter by whether all attachments are video
+- `nsfw:false` — Exclude NSFW events (a media attachment plus an NSFW hashtag,
+  see `NSFW_HASHTAGS`). NSFW events are included by default per NIP-50;
+  `nsfw:true` is accepted as a no-op.
 - `pow:<n>` — Filter by NIP-13 proof-of-work difficulty: matches events whose
   `id` has at least `n` leading zero bits, clamped to the committed target in
   the `nonce` tag. Events without a `nonce` tag have `pow:0`, e.g. `pow:20`.
@@ -234,7 +237,7 @@ All options:
 | `OPENSEARCH_INDEX` | Index name | `nostr-events` |
 | `OPENSEARCH_USERNAME` | OpenSearch basic-auth username | unset |
 | `OPENSEARCH_PASSWORD` | OpenSearch basic-auth password | unset |
-| `AUTH_KINDS` | Kinds requiring NIP-42 AUTH to query | `4,1059` |
+| `AUTH_KINDS` | Kinds requiring NIP-42 AUTH to query | `4,78,1059,30078` |
 | `AUTH_AUTHOR_EXEMPT_KINDS` | Auth kinds readable unauthenticated via explicit `authors` filters | `1059` |
 | `HISTORY_ENABLED` | Preserve history of replaceable events | `true` |
 | `HISTORY_KINDS_WHITELIST` | Only these kinds get history | unset |
@@ -245,6 +248,8 @@ All options:
 | `DITTO_LANGUAGES` | ISO 639-1 codes for per-language trends | unset |
 | `REJECTED_KINDS` | Kinds rejected at ingestion | `13,9734,20013,20014,22242,24242,27235` |
 | `BANNED_HASHTAGS` | `t` tag values rejected at ingestion | unset |
+| `NSFW_HASHTAGS` | `t` tag values that mark events with media as NSFW (`nsfw:false` excludes them; empty disables) | `nsfw,porn,...` |
+| `REJECT_NSFW` | Reject NSFW events at ingestion instead of indexing them | `false` |
 | `RELAY_MAX_MESSAGE_LENGTH` | Max inbound message size (bytes) | `4000000` |
 | `RELAY_MAX_FILTER_VALUES` | Max entries per filter array field | `20000` |
 | `RELAY_TAG_VALUE_MAX_COUNT_PER_NAME` | Max indexed values per tag name | `5000` |

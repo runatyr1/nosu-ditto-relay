@@ -6638,6 +6638,254 @@ describe("OpenSearchRelay", () => {
     });
   });
 
+  describe("NIP-50 nsfw filter", () => {
+    // Mock client honoring the must_not term clause on the nsfw field.
+    const createNsfwMockClient = () => {
+      const documents = new Map<string, unknown>();
+
+      return {
+        documents,
+        client: {
+          search: async ({ body }: { body: Record<string, unknown> }) => {
+            const results: unknown[] = [];
+            const bool = (body.query as Record<string, unknown>)?.bool as
+              | Record<string, unknown>
+              | undefined;
+            const mustNot = bool?.must_not as
+              | Array<Record<string, unknown>>
+              | undefined;
+
+            // nsfw:false produces must_not: [{ term: { nsfw: true } }]
+            let excludeNsfw = false;
+            for (const clause of mustNot || []) {
+              if ((clause.term as Record<string, unknown>)?.nsfw === true) {
+                excludeNsfw = true;
+              }
+            }
+
+            for (const [_id, doc] of documents.entries()) {
+              const docTyped = doc as NostrEvent & {
+                deleted?: boolean;
+                nsfw?: boolean;
+              };
+
+              if (docTyped.deleted) continue;
+              if (excludeNsfw && docTyped.nsfw === true) continue;
+
+              results.push({ _source: doc });
+            }
+
+            return {
+              body: {
+                hits: { hits: results },
+              },
+            };
+          },
+          bulk: async ({ body }: { body: unknown[] }) => {
+            const items: Array<Record<string, unknown>> = [];
+            for (let i = 0; i < body.length; i += 2) {
+              const action = body[i] as {
+                index?: { _id: string };
+                update?: { _id: string };
+              };
+              const payload = body[i + 1] as Record<string, unknown>;
+
+              if (action.index) {
+                documents.set(action.index._id, payload);
+                items.push({ index: {} });
+              } else if (action.update) {
+                if (payload.upsert) {
+                  if (!documents.has(action.update._id)) {
+                    documents.set(action.update._id, payload.upsert);
+                  }
+                }
+                items.push({ update: {} });
+              }
+            }
+            return {
+              body: {
+                errors: false,
+                items,
+              },
+            };
+          },
+          mget: async ({ body }: { body: { ids: string[] } }) => {
+            const docs = body.ids.map((id) => {
+              const doc = documents.get(id);
+              if (doc) return { found: true, _id: id, _source: doc };
+              return { found: false, _id: id };
+            });
+            return { body: { docs } };
+          },
+          count: async () => {
+            const nonDeleted = Array.from(documents.values()).filter(
+              (doc) => !(doc as { deleted?: boolean }).deleted,
+            );
+            return { body: { count: nonDeleted.length } };
+          },
+          updateByQuery: async () => ({ body: { updated: 0 } }),
+          msearch: async (requests: unknown[]) => ({
+            body: {
+              responses: requests.map(() => ({ hits: { hits: [] } })),
+            },
+          }),
+          indices: {
+            exists: async () => ({ body: true }),
+            create: async () => ({ body: {} }),
+          },
+          close: async () => {},
+        },
+      };
+    };
+
+    it("should store nsfw on indexed documents when passed via analysis", async () => {
+      const { client, documents } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+
+      await relay.event(event, { analysis: { media: true, nsfw: true } });
+
+      const doc = Array.from(documents.values())[0] as { nsfw?: boolean };
+      assert.equal(doc.nsfw, true);
+    });
+
+    it("should classify nsfw at ingest when no analysis is provided", async () => {
+      const { client, documents } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      // NSFW hashtag + media attachment: flagged.
+      const flagged = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "NSFW"]],
+          content: "look at this https://example.com/pic.jpg",
+        },
+        sk,
+      );
+
+      // NSFW hashtag but no attachment: not flagged.
+      const textOnly = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now - 10,
+          tags: [["t", "nsfw"]],
+          content: "just talking about the nsfw hashtag",
+        },
+        sk,
+      );
+
+      await relay.event(flagged);
+      await relay.event(textOnly);
+
+      const flaggedDoc = documents.get(flagged.id) as { nsfw?: boolean };
+      const textOnlyDoc = documents.get(textOnly.id) as { nsfw?: boolean };
+      assert.equal(flaggedDoc.nsfw, true);
+      assert.equal(textOnlyDoc.nsfw, false);
+    });
+
+    it("should exclude flagged events with nsfw:false", async () => {
+      const { client } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      const flagged = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+      const safe = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now - 10,
+          tags: [],
+          content: "a perfectly safe post",
+        },
+        sk,
+      );
+
+      await relay.event(flagged, { analysis: { media: true, nsfw: true } });
+      await relay.event(safe, { analysis: { media: false } });
+
+      const results = await relay.query([{ kinds: [1], search: "nsfw:false" }]);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].id, safe.id);
+    });
+
+    it("should include flagged events by default and with nsfw:true", async () => {
+      const { client } = createNsfwMockClient();
+      const relay = new OpenSearchRelay(client as unknown as Client, {
+        indexName: "test-index",
+        bulkMaxSize: 1,
+        refreshDelayMs: 0,
+      });
+
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+
+      const flagged = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "nsfw"]],
+          content: "https://example.com/pic.jpg",
+        },
+        sk,
+      );
+      const safe = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now - 10,
+          tags: [],
+          content: "a perfectly safe post",
+        },
+        sk,
+      );
+
+      await relay.event(flagged, { analysis: { media: true, nsfw: true } });
+      await relay.event(safe, { analysis: { media: false } });
+
+      const noToken = await relay.query([{ kinds: [1] }]);
+      assert.equal(noToken.length, 2);
+
+      const nsfwTrue = await relay.query([{ kinds: [1], search: "nsfw:true" }]);
+      assert.equal(nsfwTrue.length, 2);
+    });
+  });
+
   describe("NIP-50 sentiment filter", () => {
     // Mock client with sentiment field support
     const createSentimentMockClient = () => {
@@ -8017,6 +8265,7 @@ describe("OpenSearchRelay", () => {
         "sentiment",
         "media",
         "video",
+        "nsfw",
         "pow",
         "followers",
         "engagers",
@@ -8284,6 +8533,131 @@ describe("OpenSearchRelay", () => {
         kindExclusion,
         undefined,
         "should not exclude auth kinds when ids present",
+      );
+    });
+  });
+
+  describe("NIP-40 expiration cutoff", () => {
+    /** Issue a query at a fixed wall clock and return the cutoff sent. */
+    const cutoffAt = async (nowMs: number): Promise<string> => {
+      let capturedBody: Record<string, unknown> | undefined;
+      const mockClient = {
+        search: async ({ body }: { body: Record<string, unknown> }) => {
+          capturedBody = body;
+          return { body: { hits: { hits: [], total: { value: 0 } } } };
+        },
+      } as unknown as Client;
+
+      const relay = new OpenSearchRelay(mockClient);
+
+      const realNow = Date.now;
+      Date.now = () => nowMs;
+      try {
+        await relay.query([{ kinds: [1] }]);
+      } finally {
+        Date.now = realNow;
+      }
+
+      const boolQuery = (
+        (capturedBody as Record<string, unknown>).query as Record<
+          string,
+          unknown
+        >
+      ).bool as Record<string, unknown>;
+      const mustNot = boolQuery.must_not as Array<Record<string, unknown>>;
+      const expiration = mustNot.find(
+        (c) =>
+          (c.range as Record<string, unknown>)?.["tags_map.expiration"] !==
+          undefined,
+      );
+      assert.ok(expiration, "every query should exclude expired events");
+      const range = (expiration.range as Record<string, { lte: string }>)[
+        "tags_map.expiration"
+      ];
+      return range.lte;
+    };
+
+    it("rounds the cutoff down to a whole bucket", async () => {
+      const lte = await cutoffAt(1_788_198_037_000);
+      assert.equal(Number(lte) % 60, 0);
+      assert.equal(lte, "1788198000");
+    });
+
+    it("never excludes events that have not expired yet", async () => {
+      // Rounding down is the safe direction: an unexpired event must never
+      // be filtered, even though an expired one may linger a bucket.
+      const nowMs = 1_788_198_037_000;
+      assert.ok(Number(await cutoffAt(nowMs)) <= Math.floor(nowMs / 1000));
+    });
+
+    it("holds the clause constant within a bucket and moves between them", async () => {
+      // The whole point: an identical clause is cacheable, a per-second one
+      // rebuilds a full-segment bitset on every query.
+      const base = 1_788_198_000_000;
+      assert.equal(await cutoffAt(base), await cutoffAt(base + 59_000));
+      assert.notEqual(await cutoffAt(base), await cutoffAt(base + 60_000));
+    });
+
+    /** Query a relay whose index returns exactly `hits`, whatever is asked. */
+    const queryReturning = async (
+      hits: NostrEvent[],
+    ): Promise<NostrEvent[]> => {
+      const mockClient = {
+        search: async () => ({
+          body: {
+            hits: {
+              hits: hits.map((e) => ({ _source: e })),
+              total: { value: hits.length },
+            },
+          },
+        }),
+      } as unknown as Client;
+      return new OpenSearchRelay(mockClient).query([{ kinds: [1] }]);
+    };
+
+    it("drops events that expired inside the current bucket", async () => {
+      // The bucketed cutoff leaves these in the index's answer; the
+      // post-filter is what keeps them out of the client's.
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+      const live = finalizeEvent(
+        { kind: 1, created_at: now, tags: [], content: "live" },
+        sk,
+      );
+      const expired = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["expiration", String(now - 1)]],
+          content: "expired one second ago",
+        },
+        sk,
+      );
+
+      const events = await queryReturning([expired, live]);
+      assert.deepEqual(
+        events.map((e) => e.content),
+        ["live"],
+      );
+    });
+
+    it("keeps events whose expiration is still in the future", async () => {
+      const sk = generateSecretKey();
+      const now = Math.floor(Date.now() / 1000);
+      const event = finalizeEvent(
+        {
+          kind: 1,
+          created_at: now,
+          tags: [["expiration", String(now + 3600)]],
+          content: "expires in an hour",
+        },
+        sk,
+      );
+
+      const events = await queryReturning([event]);
+      assert.deepEqual(
+        events.map((e) => e.content),
+        ["expires in an hour"],
       );
     });
   });

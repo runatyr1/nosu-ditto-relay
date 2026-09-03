@@ -8,6 +8,7 @@ import { matchFilter, verifyEvent } from "nostr-tools";
 import type { AnalyzeResult } from "./analyze.ts";
 import { applyDeletionRequest, applyVanishRequest } from "./deletions.ts";
 import { StorageOverloaded } from "./errors.ts";
+import { isExpired } from "./expiration.ts";
 import { clip, errFields, Logger } from "./log.ts";
 import {
   relayBroadcastQueueGauge,
@@ -94,6 +95,7 @@ export interface EventAnalysis {
   sentiment?: string;
   media?: boolean;
   video?: boolean;
+  nsfw?: boolean;
 }
 
 /**
@@ -315,6 +317,8 @@ export class Relay {
   private maxLimit: number;
   /** Lowercased `t` tag values that cause an event to be rejected at ingestion. */
   private bannedHashtags: Set<string>;
+  /** Whether events classified NSFW by the analyzer are rejected at ingestion. */
+  private rejectNsfw: boolean;
   /** Kind numbers that are rejected at ingestion regardless of other policy. */
   private rejectedKinds: Set<number>;
   /** Structured logger, injected by the server entry point. */
@@ -463,6 +467,13 @@ export class Relay {
        */
       bannedHashtags?: Set<string>;
       /**
+       * Reject events the analyzer classified as NSFW instead of storing them
+       * with the flag set. Depends entirely on the analyzer's `nsfw` bit, so
+       * a relay whose NSFW hashtag set is empty rejects nothing.
+       * Default: false.
+       */
+      rejectNsfw?: boolean;
+      /**
        * Set of kind numbers that are rejected at ingestion regardless of any
        * other policy. Events matching these kinds get an `OK: false` reply
        * with a `blocked:` message and are never stored. Default: empty.
@@ -500,6 +511,7 @@ export class Relay {
     this.defaultLimit = Math.min(opts.defaultLimit ?? 100, this.maxLimit);
     this.maxInflightPerConn = opts.maxInflightPerConn ?? 32;
     this.bannedHashtags = opts.bannedHashtags ?? new Set();
+    this.rejectNsfw = opts.rejectNsfw ?? false;
     this.rejectedKinds = opts.rejectedKinds ?? new Set();
     this.negentropyMaxRecords = opts.negentropyMaxRecords ?? 1_000_000;
     this.relayInfo = {
@@ -707,7 +719,7 @@ export class Relay {
    */
   private broadcastOne(event: NostrEvent): void {
     // NIP-40: Don't broadcast expired events
-    if (this.isExpired(event)) return;
+    if (isExpired(event)) return;
 
     // Collect candidate indexed filters: kind-specific + catchAll
     const kindSet = this.kindIndex.get(event.kind);
@@ -779,20 +791,6 @@ export class Relay {
   }
 
   /**
-   * Check if an event has expired (NIP-40) by checking the "expiration" tag.
-   * Returns true if the event has an expiration tag with a timestamp in the past.
-   */
-  private isExpired(event: NostrEvent): boolean {
-    const expirationTag = event.tags.find(
-      (tag) => tag[0] === "expiration" && tag.length >= 2,
-    );
-    if (!expirationTag) return false;
-    const expiration = Number.parseInt(expirationTag[1], 10);
-    if (Number.isNaN(expiration)) return false;
-    return expiration <= Math.floor(Date.now() / 1000);
-  }
-
-  /**
    * Check if an event contains any banned hashtag (NIP-12 `t` tag).
    * Matching is case-insensitive. Returns false when no hashtags are banned.
    */
@@ -843,7 +841,7 @@ export class Relay {
     }
 
     // NIP-40: Reject events that are already expired
-    if (this.isExpired(event)) {
+    if (isExpired(event)) {
       return {
         eventId: event.id,
         accepted: false,
@@ -868,6 +866,17 @@ export class Relay {
         eventId: event.id,
         accepted: false,
         message: "blocked: event contains a banned hashtag",
+      };
+    }
+
+    // Reject NSFW events when the relay is configured not to host them.
+    // Uses the analyzer's classification (media attachment + NSFW hashtag),
+    // the same bit that would otherwise be indexed as `nsfw: true`.
+    if (this.rejectNsfw && analysis.nsfw) {
+      return {
+        eventId: event.id,
+        accepted: false,
+        message: "blocked: this relay does not accept NSFW content",
       };
     }
 
@@ -957,6 +966,7 @@ export class Relay {
           sentiment: analysis.sentiment,
           media: analysis.media,
           video: analysis.video,
+          nsfw: analysis.nsfw,
         },
       };
       await this.storage.event(event, eventOpts);

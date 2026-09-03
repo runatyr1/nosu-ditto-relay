@@ -3,6 +3,7 @@ import { NIP50, NKinds } from "@nostrify/nostrify";
 import { buildAutocompleteText } from "./autocomplete-text.ts";
 import type { Config } from "./config.ts";
 import { StorageOverloaded } from "./errors.ts";
+import { isExpired } from "./expiration.ts";
 import { clip, errFields, Logger } from "./log.ts";
 import { detectMedia } from "./media.ts";
 import {
@@ -15,6 +16,7 @@ import {
   opensearchSlotDeepHistoryCounter,
   opensearchSlotDuplicatesCounter,
 } from "./metrics.ts";
+import { DEFAULT_NSFW_HASHTAGS, detectNsfw } from "./nsfw.ts";
 import type {
   ClientOptions,
   MsearchResponseItem,
@@ -158,6 +160,28 @@ const ENGAGEMENT_QUERIES = [
 const DECAY_SORT_WINDOW_SECONDS = 7 * 24 * 3600;
 
 /**
+ * Granularity of the NIP-40 expiration cutoff attached to every query by
+ * `buildQuery`.
+ *
+ * `tags_map.expiration` is a keyword field (the `tags_map.*` dynamic
+ * template) holding millions of distinct values, so a range over it is a
+ * multi-term query: Lucene walks the terms dictionary and unions postings.
+ * It classifies such queries as costly and caches them as full-segment
+ * bitsets — which only pays off if the exact clause recurs. With a
+ * per-second cutoff it never does, so every query paid for a bitset build
+ * that was then discarded. Measured on the production index: ~12ms for a
+ * top-100 kind-1 query without the clause, ~100-200ms with a fresh cutoff,
+ * and ~13-19ms with a repeated one.
+ *
+ * Bucketing makes the clause identical for a whole minute, so one build
+ * amortizes over thousands of queries. It widens the query's answer by at
+ * most the events that expired since the bucket began, and
+ * {@link OpenSearchRelay.hitsToEvents} drops those from the result, so
+ * what a client sees is unchanged.
+ */
+const EXPIRATION_BUCKET_SECONDS = 60;
+
+/**
  * Provides the current set of trusted pubkeys for engagement counting, or
  * `undefined` when trust filtering is inactive (no WoT configured, or the
  * first WoT computation hasn't completed). Consulted per recompute tick so
@@ -240,6 +264,11 @@ interface NostrEventDocument extends NostrEvent {
   sentiment?: string;
   media: boolean;
   video: boolean;
+  /**
+   * NSFW classification: media attachment + an NSFW hashtag (see nsfw.ts).
+   * Queried by the NIP-50 `nsfw:false` extension (excludes flagged events).
+   */
+  nsfw: boolean;
   /**
    * NIP-13 proof-of-work difficulty: the number of leading zero bits in the
    * event `id`, clamped to any committed target in the `nonce` tag. Events
@@ -549,6 +578,9 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
   /** Per-instance override of TAG_VALUE_MAX_COUNT_PER_NAME. */
   private tagValueMaxCountPerName: number;
 
+  /** Lowercase NSFW hashtag set used by the ingest fallback (see nsfw.ts). */
+  private nsfwHashtags: ReadonlySet<string>;
+
   /**
    * Maximum number of events permitted to sit in the bulk queue. When
    * exceeded, {@link event} rejects new events with {@link StorageOverloaded}
@@ -587,6 +619,13 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
        */
       tagValueMaxCountPerName?: number;
       /**
+       * Lowercase NSFW hashtag set for the ingest-path fallback when no
+       * pre-computed analysis is supplied (see nsfw.ts). Defaults to
+       * {@link DEFAULT_NSFW_HASHTAGS}; entry points inject
+       * `Config.nsfwHashtags`.
+       */
+      nsfwHashtags?: ReadonlySet<string>;
+      /**
        * Structured logger. Defaults to a fresh `info`-level Logger; entry
        * points inject one built from `Config.logLevel`.
        */
@@ -609,6 +648,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     this.tagValueMaxCountPerName =
       opts?.tagValueMaxCountPerName ??
       OpenSearchRelay.TAG_VALUE_MAX_COUNT_PER_NAME;
+    this.nsfwHashtags = opts?.nsfwHashtags ?? DEFAULT_NSFW_HASHTAGS;
   }
 
   /**
@@ -634,6 +674,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       historyKindsExcluded: config.historyKindsExcluded,
       authKinds: config.authKinds,
       tagValueMaxCountPerName: config.tagValueMaxCountPerName,
+      nsfwHashtags: config.nsfwHashtags,
       logger: new Logger(config.logLevel),
     });
   }
@@ -864,6 +905,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       sentiment?: string;
       media?: boolean;
       video?: boolean;
+      nsfw?: boolean;
     },
   ): NostrEventDocument {
     const tagsMap = this.buildTagsMap(event.tags, event.kind);
@@ -906,6 +948,14 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         ? { media: analysis.media, video: analysis.video }
         : OpenSearchRelay.detectMedia(event);
 
+    // NSFW rides on media detection: when the analyzer computed media it
+    // also computed nsfw (absent = false); otherwise classify here using
+    // the local media result.
+    const nsfw =
+      analysis?.media !== undefined
+        ? (analysis.nsfw ?? false)
+        : detectNsfw(event, mediaResult.media, this.nsfwHashtags);
+
     // Use pre-computed autocomplete text from the analyze worker when
     // available; otherwise build on the main thread (direct event() calls,
     // tests). Only set the field when non-empty so events with no
@@ -927,6 +977,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
       ...(sentiment && { sentiment }),
       media: mediaResult.media ?? false,
       video: mediaResult.video ?? false,
+      nsfw,
       pow: getPow(event),
       followers: 0,
       engagers: 0,
@@ -1225,13 +1276,34 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
 
   /**
    * Extract hits from an OpenSearch response as NostrEvent[].
+   *
+   * Expired events (NIP-40) are dropped here, which is what makes the
+   * bucketed cutoff in {@link buildQuery} safe: the query excludes
+   * everything expired as of the start of the current bucket, and this
+   * removes the stragglers that expired since. Filtering in memory over
+   * at most `limit` events costs a tag scan each, against a keyword range
+   * over millions of terms in OpenSearch.
+   *
+   * Every read path that returns events funnels through here and asks
+   * OpenSearch to exclude expired events, so the default filters. The
+   * paths that deliberately reach expired events — `remove` and
+   * `queryIdsBatch`, which pass `includeExpired` to `buildQuery` — read
+   * ids straight off the response instead and never arrive here; `opts`
+   * mirrors `buildQuery` so a future one can opt out explicitly rather
+   * than lose its hits to a filter it didn't know about.
    */
-  private hitsToEvents(response: {
-    body: SearchResponseBody<NostrEvent>;
-  }): NostrEvent[] {
-    return response.body.hits.hits.flatMap((hit) =>
+  private hitsToEvents(
+    response: {
+      body: SearchResponseBody<NostrEvent>;
+    },
+    opts?: { includeExpired?: boolean },
+  ): NostrEvent[] {
+    const events = response.body.hits.hits.flatMap((hit) =>
       hit._source !== undefined ? [hit._source] : [],
     );
+    if (opts?.includeExpired) return events;
+    const now = Math.floor(Date.now() / 1000);
+    return events.filter((event) => !isExpired(event, now));
   }
 
   /**
@@ -1592,10 +1664,17 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
 
     // NIP-40: Exclude expired events. Deletion opts out — an expired event is
     // still stored, and a vanish request must reach it.
+    //
+    // The cutoff is rounded down to EXPIRATION_BUCKET_SECONDS so the clause is
+    // byte-identical across a whole bucket. See the constant for why that
+    // matters; a per-second cutoff makes this the most expensive part of an
+    // otherwise cheap query. This clause is therefore a coarse pre-filter —
+    // `hitsToEvents` drops whatever expired since the bucket began.
     if (!opts?.includeExpired) {
       const now = Math.floor(Date.now() / 1000);
+      const cutoff = now - (now % EXPIRATION_BUCKET_SECONDS);
       mustNot.push({
-        range: { "tags_map.expiration": { lte: String(now) } },
+        range: { "tags_map.expiration": { lte: String(cutoff) } },
       });
     }
 
@@ -1779,6 +1858,20 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         }
       }
 
+      // Handle nsfw: extension (NIP-50). Per the NIP, nsfw events are
+      // included by default; `nsfw:false` excludes them. `nsfw:true`
+      // restores the default (no clause) rather than meaning "only nsfw".
+      const nsfwToken = tokens.find(
+        (t) => typeof t === "object" && t.key === "nsfw",
+      );
+      if (
+        nsfwToken &&
+        typeof nsfwToken === "object" &&
+        nsfwToken.value === "false"
+      ) {
+        mustNot.push({ term: { nsfw: true } });
+      }
+
       // Handle pow: extension (NIP-50 + NIP-13).
       // `pow:<n>` matches events whose stored proof-of-work difficulty is
       // at least `n` leading zero bits. Events without a `nonce` tag are
@@ -1939,6 +2032,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
         sentiment?: string;
         media?: boolean;
         video?: boolean;
+        nsfw?: boolean;
       };
     },
   ): Promise<void> {
@@ -3064,6 +3158,12 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
    *
    * When distinct:author is present, uses a cardinality aggregation on pubkey
    * to return the number of unique authors instead of total events.
+   *
+   * A count is the one read that cannot post-filter expired events the way
+   * {@link hitsToEvents} does — there are no documents to inspect — so it
+   * may include events that expired within the current
+   * EXPIRATION_BUCKET_SECONDS. NIP-45 counts are already advertised as
+   * approximate.
    */
   async count(
     filters: NostrFilter[],
@@ -3329,6 +3429,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
     sentiment: { type: "keyword" },
     media: { type: "boolean" },
     video: { type: "boolean" },
+    nsfw: { type: "boolean" },
     pow: { type: "integer" },
     followers: { type: "integer" },
     engagers: { type: "integer" },

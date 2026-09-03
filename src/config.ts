@@ -3,6 +3,7 @@ import { NSecSigner } from "@nostrify/nostrify";
 import { nip19 } from "nostr-tools";
 
 import type { LogLevel } from "./log.ts";
+import { DEFAULT_NSFW_HASHTAGS } from "./nsfw.ts";
 
 export class Config {
   readonly port: number;
@@ -48,7 +49,8 @@ export class Config {
    * Filters including these kinds must have `authors` or `#p` arrays where ALL
    * entries are authenticated pubkeys on the connection.
    * These kinds are also excluded from queries that don't explicitly include them.
-   * Default: 4,1059 (NIP-04 DMs and NIP-59 Gift Wraps).
+   * Default: 4,78,1059,30078 (NIP-04 DMs, NIP-59 gift wraps, and NIP-78
+   * application-specific data).
    */
   readonly authKinds: Set<number>;
   /**
@@ -141,6 +143,24 @@ export class Config {
    * Comma-separated, case-insensitive. Default: empty (no hashtags banned).
    */
   readonly bannedHashtags: Set<string>;
+  /**
+   * Set of NSFW hashtags (lowercased `t` tag values). An event carrying both
+   * a media attachment and any of these hashtags is indexed with `nsfw: true`
+   * and can be excluded from search results with the NIP-50 `nsfw:false`
+   * extension token. Comma-separated, case-insensitive. Set to an empty value
+   * to disable NSFW classification. Default: see `DEFAULT_NSFW_HASHTAGS` in
+   * nsfw.ts.
+   */
+  readonly nsfwHashtags: Set<string>;
+  /**
+   * Whether to reject NSFW events at ingestion instead of merely indexing
+   * them with `nsfw: true`. Matching events get an `OK: false` reply with a
+   * `blocked:` message and are never stored. Classification is unchanged —
+   * it still requires both a media attachment and a hashtag from
+   * `nsfwHashtags`, so an empty `NSFW_HASHTAGS` disables this too.
+   * Default: false (classify but accept).
+   */
+  readonly rejectNsfw: boolean;
   /**
    * Set of kind numbers that are rejected at ingestion regardless of any
    * other policy. Events matching these kinds get an `OK: false` reply with
@@ -299,7 +319,7 @@ export class Config {
     // authKinds
     const authValue = env.get("AUTH_KINDS");
     if (authValue === undefined) {
-      this.authKinds = new Set([4, 1059]);
+      this.authKinds = new Set([4, 78, 1059, 30078]);
     } else {
       const kinds = authValue
         .split(",")
@@ -475,6 +495,23 @@ export class Config {
         .filter((s) => s.length > 0);
       this.bannedHashtags = new Set(tags);
     }
+
+    // nsfwHashtags: unset = defaults; explicitly empty = classification off.
+    const nsfwHashtagsValue = env.get("NSFW_HASHTAGS");
+    if (nsfwHashtagsValue === undefined) {
+      this.nsfwHashtags = new Set(DEFAULT_NSFW_HASHTAGS);
+    } else {
+      const tags = nsfwHashtagsValue
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0);
+      this.nsfwHashtags = new Set(tags);
+    }
+
+    // rejectNsfw
+    const rejectNsfwValue = env.get("REJECT_NSFW");
+    this.rejectNsfw =
+      rejectNsfwValue?.toLowerCase() === "true" || rejectNsfwValue === "1";
 
     // rejectedKinds
     const rejectedKindsValue = env.get("REJECTED_KINDS");

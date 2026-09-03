@@ -103,7 +103,7 @@ const storage: AnalyzableRelay & SyncableStorage = {
 // this thread. The wasm verify is the dominant cost (~fraction of a ms) and
 // is sharded across protocol workers, so an EVENT never pays a cross-thread
 // round trip for analysis.
-const analyze = await createAnalyzer();
+const analyze = await createAnalyzer({ nsfwHashtags: config.nsfwHashtags });
 
 // ---------------------------------------------------------------------------
 // Outbound batching: frames and accepted-event fan-out
@@ -156,6 +156,7 @@ const relay = new Relay(storage, {
   maxEventTags: config.tagValueMaxCountPerName,
   maxInflightPerConn: config.maxInflightPerConn,
   bannedHashtags: config.bannedHashtags,
+  rejectNsfw: config.rejectNsfw,
   rejectedKinds: config.rejectedKinds,
   negentropyMaxRecords: config.negentropyMaxRecords,
   onEventAccepted: (event) => {
