@@ -17,9 +17,11 @@
 // where each <hex> is a bare sha256 (no "sha256:" prefix) — the spelling both
 // Blossom and the 30624 event use. Diagnostics go to stderr so stdout stays a
 // clean, parseable contract.
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import process from "node:process";
 
 const OCI_INDEX = "application/vnd.oci.image.index.v1+json";
 
@@ -56,7 +58,11 @@ for (const desc of index.manifests ?? []) {
 const indexDoc = JSON.stringify({
   schemaVersion: 2,
   mediaType: OCI_INDEX,
-  manifests: (index.manifests ?? []).map(({ mediaType, digest, size }) => ({ mediaType, digest, size })),
+  manifests: (index.manifests ?? []).map(({ mediaType, digest, size }) => ({
+    mediaType,
+    digest,
+    size,
+  })),
 });
 const indexBytes = Buffer.from(indexDoc, "utf8");
 const indexDigest = createHash("sha256").update(indexBytes).digest("hex");
@@ -69,4 +75,4 @@ if (tags.length === 0) {
   process.exit(1);
 }
 
-process.stdout.write(JSON.stringify({ tags }) + "\n");
+process.stdout.write(`${JSON.stringify({ tags })}\n`);
