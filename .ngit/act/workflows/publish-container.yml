@@ -1,0 +1,98 @@
+name: Publish container
+
+# Build this repo's Docker image and publish it to ncontainer.io — an OCI
+# registry backed by Nostr (a signed kind-30624 event holds the tag->digest map)
+# + Blossom (the layer blobs), where the image NAME is the publisher's signing
+# identity (see nostr://npub1scv.../ncontainer, and armada-stack's pull mode).
+#
+# The whole job is scripts/publish-container.sh; this file only provides the
+# runner, the toolchain, and the signer secrets. It is a DROP-IN: every
+# component image repo carries the same two files (this + the script + its
+# oci-tags.mjs helper) and publishes ITS OWN image under whatever identity the
+# secrets name. Here that identity is the soapbox account, signed through its
+# NIP-46 bunker so no raw key ever lands on the runner.
+#
+# The published image is `armada-relay` (IMAGE_NAME below), matching the pull
+# ref in armada-stack's docker-compose.pull.yml — NOT the repo's `d` identifier
+# (ditto-relay), which is independent of the image name.
+#
+# ── Trigger ──────────────────────────────────────────────────────────────────
+# A push to main by a maintainer. ngit-ci injects ${{ secrets.* }} ONLY on
+# maintainer-authored triggers, and a push to a watched repo qualifies; a Nostr
+# PR from a non-maintainer gets no secrets, so the identity guard in the script
+# fails closed rather than publishing under the wrong name. The image tracks the
+# source, so "source moved" (a push) is exactly when it should rebuild.
+#
+# ── Secrets (provisioned by the ngit-ci operator for THIS repo's alias) ───────
+# Scoped to this repo by its maintainer graph, so they must be provisioned under
+# an alias whose root is a maintainer of THIS repo. The bunker they name signs
+# AS soapbox, which is what puts the image in the soapbox namespace.
+#   NCONTAINER_SIGNER      the soapbox bunker:// URL (or an nsec, for a raw key)
+#   NCONTAINER_CONNECT_AS  the persistent NIP-46 client key that bunker authorized
+#   NCONTAINER_NPUB        soapbox's npub — the namespace, and a guard the script
+#                          checks the signer actually signs as before building
+#   PUBLISH_RELAYS         comma-separated relays the kind-30624 event goes to
+#   BLOSSOM_SERVERS        comma-separated Blossom servers the layers upload to
+# An unprovisioned NCONTAINER_SIGNER FAILS the job (the script's `:?` guard),
+# not skips it: a green run that published nothing would be a lie.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Only nak needs installing: docker, buildx and node already ship in the
+      # coordinator's runner image. The build is `docker buildx ... --output
+      # type=oci` against the host daemon the coordinator mounts into each job
+      # container (NGIT_CI_ACT_CONTAINER_DAEMON_SOCKET), which is what lets the
+      # network-dependent RUN steps (bun/npm install) run at all — a daemonless
+      # buildah build cannot, on the coordinator's unprivileged Proxmox LXC (the
+      # nested user namespace forbids the netns operations RUN steps need). See
+      # scripts/publish-container.sh's header.
+      - name: Install nak
+        env:
+          NAK_VERSION: v0.15.2
+        run: |
+          set -eu
+          # nak is a single static Go binary.
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64|amd64) nak_arch=amd64 ;;
+            aarch64|arm64) nak_arch=arm64 ;;
+            *) echo "unsupported arch for nak: $arch" >&2; exit 1 ;;
+          esac
+          sudo curl -fsSL --retry 3 -o /usr/local/bin/nak \
+            "https://github.com/fiatjaf/nak/releases/download/${NAK_VERSION}/nak-${NAK_VERSION}-linux-${nak_arch}"
+          sudo chmod +x /usr/local/bin/nak
+          nak --version
+
+      - name: Build and publish to ncontainer.io
+        env:
+          # The bunker signs AS soapbox; the client key is what it authorized.
+          NCONTAINER_SIGNER: ${{ secrets.NCONTAINER_SIGNER }}
+          NCONTAINER_CONNECT_AS: ${{ secrets.NCONTAINER_CONNECT_AS }}
+          NCONTAINER_NPUB: ${{ secrets.NCONTAINER_NPUB }}
+          PUBLISH_RELAYS: ${{ secrets.PUBLISH_RELAYS }}
+          BLOSSOM_SERVERS: ${{ secrets.BLOSSOM_SERVERS }}
+          # The 30624 `d` tag / image name. The script defaults it to the
+          # checkout dir basename, which under act is the job workdir, not the
+          # repo — so name it explicitly here. `armada-relay`, not `ditto-relay`:
+          # the image name matches armada-stack's pull ref, not the repo id.
+          IMAGE_NAME: armada-relay
+        run: |
+          set -eu
+          # No apostrophe in that message: bash treats a single quote inside
+          # ${var:?word} as opening a quoted section even within the double
+          # quotes, and swallows the rest of the script.
+          : "${NCONTAINER_SIGNER:?The ngit-ci operator has not provisioned NCONTAINER_SIGNER for this repos alias.}"
+          bash scripts/publish-container.sh
