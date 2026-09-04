@@ -7,21 +7,6 @@ import type {
 import type { TrustProvider } from "./opensearch.ts";
 import type { Client } from "./opensearch-client.ts";
 
-/**
- * Maximum authors returned per tag-value bucket in trusted (WoT) mode.
- * Values used by more unique authors than this are undercounted; only
- * sybil-swarmed values realistically get near the cap.
- */
-const TRUSTED_AUTHOR_AGG_SIZE = 1000;
-
-/**
- * Bucket over-fetch factor in trusted mode. Buckets come back ordered by
- * raw doc count, so a value pumped by untrusted authors can crowd trusted
- * values out of the top `limit` buckets; over-fetching gives the
- * client-side trusted re-sort real candidates to work with.
- */
-const TRUSTED_BUCKET_OVERFETCH = 5;
-
 /** A single trending tag value with engagement metrics. */
 export interface TrendingTagValue {
   /** The tag value (lowercased). */
@@ -112,17 +97,28 @@ export class Trends {
       must.push({ term: { language } });
     }
 
+    // In trusted (WoT) mode, restrict the whole query to trusted authors so
+    // the aggregation never sees a sybil swarm in the first place. Doing it
+    // here rather than over the results is what keeps this bounded: the
+    // previous approach asked each value bucket for its top 1000 authors and
+    // filtered them in JS, which created `bucketSize * authors-per-value`
+    // buckets — ~142 000 for trending pubkeys against a 65 535 ceiling,
+    // because kind 3 contact lists carry hundreds of `p` tags each. It also
+    // silently dropped every author past the 1000th and needed a bucket
+    // over-fetch to compensate for ordering by untrusted doc counts. Both
+    // problems disappear once the engine only counts trusted docs.
+    //
+    // This is one `terms` clause holding the entire WoT set, which is why
+    // the index raises `max_terms_count` (see MAX_TERMS_COUNT).
+    const trusted = this.trustProvider?.();
+    if (trusted) {
+      must.push({ terms: { pubkey: [...trusted] } });
+    }
+
     // We need to run one aggregation per tag name (e.g. "e" and "q"), then
     // merge the buckets client-side.  Each tag name maps to a different
     // `tags_map.<name>` keyword field in OpenSearch.
-    //
-    // In trusted (WoT) mode each value bucket returns its authors as a
-    // terms sub-agg instead of a cardinality, so the readout can count
-    // only trusted ones — and buckets are over-fetched because the raw
-    // doc-count ordering is exactly what sybil swarms inflate.
-    const trusted = this.trustProvider?.();
-    const bucketSize =
-      limit * tagNames.length * (trusted ? TRUSTED_BUCKET_OVERFETCH : 1);
+    const bucketSize = limit * tagNames.length;
     const aggs: Record<string, unknown> = {};
 
     for (const tagName of tagNames) {
@@ -142,24 +138,11 @@ export class Trends {
               field,
               size: bucketSize,
             },
-            aggs: trusted
-              ? {
-                  authors: {
-                    terms: {
-                      field: "pubkey",
-                      size: TRUSTED_AUTHOR_AGG_SIZE,
-                      // Build the term map from matched docs rather than
-                      // global ordinals over every pubkey in the shard —
-                      // pubkey is ultra-high-cardinality.
-                      execution_hint: "map",
-                    },
-                  },
-                }
-              : {
-                  unique_authors: {
-                    cardinality: { field: "pubkey" },
-                  },
-                },
+            aggs: {
+              unique_authors: {
+                cardinality: { field: "pubkey" },
+              },
+            },
           },
         },
       };
@@ -188,9 +171,6 @@ export class Trends {
                 key: string;
                 doc_count: number;
                 unique_authors?: { value: number };
-                authors?: {
-                  buckets?: Array<{ key: string; doc_count: number }>;
-                };
               }>;
             };
           }
@@ -203,21 +183,11 @@ export class Trends {
         // Marker tags with no value are indexed as '' — never trend those.
         if (!key) continue;
 
-        let authors: number;
-        let uses: number;
-        if (trusted) {
-          // Only trusted authors count; a value used exclusively by
-          // untrusted pubkeys never trends at all.
-          const authorBuckets = (bucket.authors?.buckets ?? []).filter((b) =>
-            trusted.has(b.key),
-          );
-          authors = authorBuckets.length;
-          uses = authorBuckets.reduce((sum, b) => sum + b.doc_count, 0);
-          if (authors === 0) continue;
-        } else {
-          authors = bucket.unique_authors?.value ?? 0;
-          uses = bucket.doc_count;
-        }
+        // In trusted mode the query already excluded untrusted authors, so
+        // these are trusted counts and a value used only by untrusted
+        // pubkeys has no bucket here at all.
+        const authors = bucket.unique_authors?.value ?? 0;
+        const uses = bucket.doc_count;
 
         const existing = merged.get(key);
 

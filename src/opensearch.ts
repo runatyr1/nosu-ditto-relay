@@ -798,6 +798,23 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
   static readonly MAX_RESULT_WINDOW = 100000;
 
   /**
+   * Ceiling on how many values a single `terms` query may carry, mirroring
+   * the `index.max_terms_count` setting applied at index creation and in
+   * {@link migrate}.
+   *
+   * Raised well above the OpenSearch default of 65 536 for the sake of
+   * trends: `trends.ts` filters its aggregations to the web-of-trust set,
+   * which is one `terms` clause holding every trusted pubkey. That set is
+   * seeds expanded two follow-hops, so it tracks the size of the reachable
+   * network — it was already ~80 000 when this was raised, and the default
+   * rejected the query outright. A terms filter is cheap relative to the
+   * aggregation it guards (65 536 terms measured at ~190 ms), so the
+   * headroom costs little; the value only needs to stay ahead of
+   * `WotSet.refresh`.
+   */
+  static readonly MAX_TERMS_COUNT = 262144;
+
+  /**
    * Check whether a tag name is indexable.
    *
    * - All single-character tag names are allowed (covers a-z, A-Z, `-`, etc.).
@@ -3577,6 +3594,24 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
           .body;
 
       if (exists) {
+        // `index.max_terms_count` is a dynamic setting, so unlike the
+        // analyzer below it needs no close/open. Applied in its own call
+        // for that reason: the close/open block can fail (it briefly pauses
+        // writes and is the riskier of the two), and trends must not stay
+        // broken just because the analyzer update did.
+        try {
+          await this.writeClient.indices.putSettings({
+            index: this.indexName,
+            body: {
+              settings: {
+                "index.max_terms_count": OpenSearchRelay.MAX_TERMS_COUNT,
+              },
+            },
+          });
+        } catch (e) {
+          this.log.warn("max_terms_count_update_failed", errFields(e));
+        }
+
         // Add custom analyzer settings (requires close/open).
         // This is idempotent — if the analyzer already exists, the close/open
         // is a harmless no-op that briefly pauses writes.
@@ -3626,6 +3661,7 @@ export class OpenSearchRelay implements NStore, AsyncDisposable {
             number_of_shards: 3,
             number_of_replicas: 1,
             "index.max_result_window": OpenSearchRelay.MAX_RESULT_WINDOW,
+            "index.max_terms_count": OpenSearchRelay.MAX_TERMS_COUNT,
             ...OpenSearchRelay.ANALYZER_SETTINGS,
           },
           mappings: {

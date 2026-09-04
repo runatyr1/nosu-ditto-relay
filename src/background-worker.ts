@@ -263,21 +263,63 @@ if (trends) {
   const relayUrl = config.relayUrl;
   const preferredLanguages = config.preferredLanguages;
 
+  /**
+   * Run one trend type, logging rather than throwing on failure.
+   *
+   * The types are independent — each publishes its own kind 1985 label —
+   * so one failing must not cancel the rest. They used to run as a bare
+   * `await` chain under a single catch, and when the trending-pubkeys
+   * aggregation started exceeding `search.max_buckets` it took trending
+   * events, zapped events and every per-language feed down with it, all
+   * behind one undifferentiated `trends_update_failed`. Naming the type
+   * also means the log says which one broke.
+   */
+  const runTrend = async (name: string, fn: () => Promise<void>) => {
+    try {
+      await fn();
+      return true;
+    } catch (err) {
+      log.error("trends_update_failed", { trend: name, ...errFields(err) });
+      return false;
+    }
+  };
+
   const updateAllTrends = async () => {
     log.info("trends_updating");
-    await t.updateTrendingHashtags(signer);
-    await t.updateTrendingLinks(signer);
-    await t.updateTrendingPubkeys(signer, relayUrl);
-    await t.updateTrendingEvents(signer, relayUrl);
-    await t.updateTrendingZappedEvents(signer, relayUrl);
+
+    // Sequential on purpose: these are heavy aggregations over the same
+    // index, and running them concurrently would spike OpenSearch.
+    const results = [
+      await runTrend("hashtags", () => t.updateTrendingHashtags(signer)),
+      await runTrend("links", () => t.updateTrendingLinks(signer)),
+      await runTrend("pubkeys", () =>
+        t.updateTrendingPubkeys(signer, relayUrl),
+      ),
+      await runTrend("events", () => t.updateTrendingEvents(signer, relayUrl)),
+      await runTrend("zapped", () =>
+        t.updateTrendingZappedEvents(signer, relayUrl),
+      ),
+    ];
+
     if (preferredLanguages.length > 0) {
-      await t.updateTrendingEventsByLanguage(
-        signer,
-        relayUrl,
-        preferredLanguages,
+      // Already `allSettled` internally, so a single language cannot sink
+      // the others.
+      results.push(
+        await runTrend("by_language", () =>
+          t.updateTrendingEventsByLanguage(
+            signer,
+            relayUrl,
+            preferredLanguages,
+          ),
+        ),
       );
     }
-    log.info("trends_updated");
+
+    const failed = results.filter((ok) => !ok).length;
+    log.info("trends_updated", {
+      succeeded: results.length - failed,
+      failed,
+    });
   };
 
   /** Guards against overlapping trend updates, as in the recompute loop. */
@@ -290,7 +332,9 @@ if (trends) {
     }
     trendsInFlight = true;
     updateAllTrends()
-      .catch((err) => log.error("trends_update_failed", errFields(err)))
+      // `runTrend` already absorbs per-trend failures, so reaching this
+      // means the loop itself broke, not one aggregation.
+      .catch((err) => log.error("trends_cycle_failed", errFields(err)))
       .finally(() => {
         trendsInFlight = false;
       });

@@ -8246,6 +8246,101 @@ describe("OpenSearchRelay", () => {
   });
 
   describe("migrate", () => {
+    // `trends.ts` filters its aggregations with one `terms` clause holding
+    // the entire web-of-trust set, which outgrew OpenSearch's default
+    // `index.max_terms_count` of 65 536. Both the create and the
+    // already-exists path have to raise it, or trends break on exactly the
+    // deployments that have been running longest.
+    describe("index.max_terms_count", () => {
+      /** Mock capturing whichever indices calls migrate makes. */
+      const createIndicesMock = (indexExists: boolean) => {
+        const created: Array<Record<string, unknown>> = [];
+        const settings: Array<Record<string, unknown>> = [];
+        const client = {
+          indices: {
+            exists: async () => ({ body: indexExists }),
+            existsAlias: async () => ({ body: false }),
+            create: async ({ body }: { body: Record<string, unknown> }) => {
+              created.push(body);
+              return { body: {} };
+            },
+            putSettings: async ({
+              body,
+            }: {
+              body: Record<string, unknown>;
+            }) => {
+              settings.push(body);
+              return { body: {} };
+            },
+            putMapping: async () => ({ body: {} }),
+            close: async () => ({ body: {} }),
+            open: async () => ({ body: {} }),
+          },
+        };
+        return { client, created, settings };
+      };
+
+      it("is set when creating a new index", async () => {
+        const { client, created } = createIndicesMock(false);
+        const relay = new OpenSearchRelay(client as unknown as Client, {
+          indexName: "test-index",
+        });
+
+        await relay.migrate();
+
+        assert.equal(created.length, 1);
+        const s = created[0].settings as Record<string, unknown>;
+        assert.equal(
+          s["index.max_terms_count"],
+          OpenSearchRelay.MAX_TERMS_COUNT,
+        );
+      });
+
+      it("is applied to an existing index", async () => {
+        const { client, settings } = createIndicesMock(true);
+        const relay = new OpenSearchRelay(client as unknown as Client, {
+          indexName: "test-index",
+        });
+
+        await relay.migrate();
+
+        const applied = settings.find(
+          (b) =>
+            (b.settings as Record<string, unknown>)?.["index.max_terms_count"],
+        );
+        assert.ok(applied, "expected max_terms_count to be applied");
+        assert.equal(
+          (applied.settings as Record<string, unknown>)[
+            "index.max_terms_count"
+          ],
+          OpenSearchRelay.MAX_TERMS_COUNT,
+        );
+      });
+
+      it("still applies when the analyzer update fails", async () => {
+        // It is a dynamic setting needing no close/open, so it must not be
+        // coupled to the riskier close/putSettings/open block.
+        const { client, settings } = createIndicesMock(true);
+        client.indices.close = async () => {
+          throw new Error("close failed");
+        };
+        const relay = new OpenSearchRelay(client as unknown as Client, {
+          indexName: "test-index",
+        });
+
+        await relay.migrate();
+
+        assert.ok(
+          settings.some(
+            (b) =>
+              (b.settings as Record<string, unknown>)?.[
+                "index.max_terms_count"
+              ],
+          ),
+        );
+      });
+    });
+
     it("should reject documents with unknown fields (dynamic: strict)", async () => {
       const KNOWN_FIELDS = new Set([
         "id",

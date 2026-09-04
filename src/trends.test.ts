@@ -61,6 +61,8 @@ function buildTagsMap(tags: string[][]): Record<string, string[]> {
  */
 function createMockClient() {
   const documents: MockDocument[] = [];
+  /** Every search body issued, so tests can assert on the query shape. */
+  const searches: Array<Record<string, unknown>> = [];
 
   /** Check whether a document passes a set of bool/must clauses. */
   function matchesClauses(
@@ -116,6 +118,7 @@ function createMockClient() {
 
   const client = {
     search: async ({ body }: { body: Record<string, unknown> }) => {
+      searches.push(body);
       const aggs = body.aggs as
         | Record<string, Record<string, unknown>>
         | undefined;
@@ -161,44 +164,22 @@ function createMockClient() {
           }
         }
 
-        // Build response buckets. The sub-agg decides the shape: trusted
-        // mode asks for a per-pubkey `authors` terms agg, the default asks
-        // for a `unique_authors` cardinality.
-        const wantsAuthors = Boolean(
-          (termsAgg.aggs as Record<string, unknown> | undefined)?.authors,
-        );
-
+        // Both modes ask for the same shape — a `unique_authors` cardinality.
+        // Trusted mode differs only in that the query filtered out untrusted
+        // authors before they ever reached the aggregation.
         const buckets: Array<{
           key: string;
           doc_count: number;
-          unique_authors?: { value: number };
-          authors?: { buckets: Array<{ key: string; doc_count: number }> };
+          unique_authors: { value: number };
         }> = [];
 
         for (const [key, bucket] of valueBuckets.entries()) {
-          if (wantsAuthors) {
-            const byPubkey = new Map<string, number>();
-            for (const doc of bucket.docs) {
-              byPubkey.set(doc.pubkey, (byPubkey.get(doc.pubkey) ?? 0) + 1);
-            }
-            buckets.push({
-              key,
-              doc_count: bucket.docs.length,
-              authors: {
-                buckets: [...byPubkey.entries()].map(([pk, count]) => ({
-                  key: pk,
-                  doc_count: count,
-                })),
-              },
-            });
-          } else {
-            const uniquePubkeys = new Set(bucket.docs.map((d) => d.pubkey));
-            buckets.push({
-              key,
-              doc_count: bucket.docs.length,
-              unique_authors: { value: uniquePubkeys.size },
-            });
-          }
+          const uniquePubkeys = new Set(bucket.docs.map((d) => d.pubkey));
+          buckets.push({
+            key,
+            doc_count: bucket.docs.length,
+            unique_authors: { value: uniquePubkeys.size },
+          });
         }
 
         // Sort by doc_count desc and limit
@@ -224,7 +205,7 @@ function createMockClient() {
     });
   }
 
-  return { client: client as unknown as Client, documents, addEvent };
+  return { client: client as unknown as Client, documents, addEvent, searches };
 }
 
 /** Deterministic fake event builder (no real signatures needed for mock). */
@@ -275,7 +256,7 @@ function createMockSigner(pubkey: string): NostrSigner {
 
 /** Helper to create a Trends instance with mock dependencies. */
 function createTrends(opts?: { trusted?: ReadonlySet<string> }) {
-  const { client, documents, addEvent } = createMockClient();
+  const { client, documents, addEvent, searches } = createMockClient();
   const relay = createMockRelay();
   const trends = new Trends({
     client,
@@ -283,7 +264,7 @@ function createTrends(opts?: { trusted?: ReadonlySet<string> }) {
     relay,
     ...(opts?.trusted && { trustProvider: () => opts.trusted }),
   });
-  return { trends, client, documents, addEvent, relay };
+  return { trends, client, documents, addEvent, relay, searches };
 }
 
 describe("Trends", () => {
@@ -910,6 +891,73 @@ describe("Trends", () => {
   });
 
   describe("getTrendingTagValues with trust provider", () => {
+    // Regression: trusted mode used to ask each value bucket for its top
+    // 1000 authors and filter them in JS. That made the bucket count
+    // `bucketSize * authors-per-value` — ~142 000 for trending pubkeys on
+    // the production index, against OpenSearch's 65 535 `search.max_buckets`
+    // ceiling — so every trends cycle died with `too_many_buckets_exception`.
+    // The fix is to filter to trusted authors in the query instead, which is
+    // both bounded and exact. These assert the shape, since the mock cannot
+    // enforce a bucket ceiling.
+    describe("bucket budget", () => {
+      it("filters to trusted authors in the query", async () => {
+        const trusted = new Set(["a".repeat(64), "b".repeat(64)]);
+        const { trends, searches } = createTrends({ trusted });
+
+        await trends.getTrendingTagValues(["t"], { kinds: [1], limit: 20 });
+
+        const must = (
+          searches[0].query as {
+            bool: { must: Array<Record<string, unknown>> };
+          }
+        ).bool.must;
+        const pubkeyClause = must.find(
+          (c) => (c.terms as Record<string, unknown>)?.pubkey,
+        );
+        assert.ok(pubkeyClause, "expected a terms filter on pubkey");
+        assert.deepEqual(
+          (pubkeyClause.terms as { pubkey: string[] }).pubkey.sort(),
+          [...trusted].sort(),
+        );
+      });
+
+      it("never nests a per-author terms agg under the value buckets", async () => {
+        const { trends, searches } = createTrends({
+          trusted: new Set(["a".repeat(64)]),
+        });
+
+        await trends.getTrendingTagValues(["t"], { kinds: [1], limit: 20 });
+
+        // A `terms` sub-agg here is what multiplied the bucket count; a
+        // `cardinality` produces exactly one bucket per value.
+        const subAggs = JSON.stringify(searches[0].aggs);
+        assert.ok(!subAggs.includes('"authors"'), "author terms agg is back");
+        assert.ok(subAggs.includes('"cardinality"'));
+      });
+
+      it("does not over-fetch value buckets in trusted mode", async () => {
+        // The over-fetch existed only to compensate for buckets being
+        // ordered by untrusted doc counts. With the query filtered, the
+        // ordering is already trusted-only.
+        const { trends: plain, searches: plainSearches } = createTrends();
+        const { trends: wot, searches: wotSearches } = createTrends({
+          trusted: new Set(["a".repeat(64)]),
+        });
+
+        await plain.getTrendingTagValues(["t"], { kinds: [1], limit: 20 });
+        await wot.getTrendingTagValues(["t"], { kinds: [1], limit: 20 });
+
+        const sizeOf = (s: Record<string, unknown>) =>
+          (
+            (s.aggs as Record<string, { aggs: { values: { terms: unknown } } }>)
+              .tag_t.aggs.values.terms as { size: number }
+          ).size;
+
+        assert.equal(sizeOf(wotSearches[0]), 20);
+        assert.equal(sizeOf(wotSearches[0]), sizeOf(plainSearches[0]));
+      });
+    });
+
     it("counts only trusted authors and drops untrusted-only values", async () => {
       const trustedA = "a".repeat(64);
       const trustedB = "b".repeat(64);
