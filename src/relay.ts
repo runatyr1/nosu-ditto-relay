@@ -335,6 +335,9 @@ export class Relay {
    */
   private onEventAccepted?: (event: NostrEvent) => void;
 
+  /** See the constructor option of the same name. */
+  private onInterestChanged?: () => void;
+
   /** All open WebSocket connections. */
   private connections = new Set<RelayConn>();
 
@@ -497,11 +500,19 @@ export class Relay {
        * to sibling workers. See the field doc on {@link Relay.onEventAccepted}.
        */
       onEventAccepted?: (event: NostrEvent) => void;
+      /**
+       * Hook invoked whenever the live-subscription index changes. Protocol
+       * workers use it to report which kinds they can match so the pool can
+       * skip fanning events out to workers that would only discard them.
+       * Fires on every REQ and CLOSE, so debounce before doing real work.
+       */
+      onInterestChanged?: () => void;
     },
   ) {
     this.storage = storage;
     this.log = opts.logger ?? new Logger();
     this.onEventAccepted = opts.onEventAccepted;
+    this.onInterestChanged = opts.onInterestChanged;
     this.analyze = opts.analyze ?? defaultAnalyze;
     this.relayUrl = opts.relayUrl;
     this.authKinds = opts.authKinds ?? new Set();
@@ -606,6 +617,21 @@ export class Relay {
         this.catchAll.add(entry);
       }
     }
+
+    this.onInterestChanged?.();
+  }
+
+  /**
+   * The kinds this relay currently has live subscriptions for.
+   *
+   * `catchAll` means at least one filter omits `kinds`, so every event has
+   * to be offered regardless of the kind list.
+   */
+  subscriptionInterest(): { kinds: number[]; catchAll: boolean } {
+    return {
+      kinds: [...this.kindIndex.keys()],
+      catchAll: this.catchAll.size > 0,
+    };
   }
 
   /**
@@ -646,6 +672,8 @@ export class Relay {
     if (connFilters.size === 0) {
       this.connectionFilters.delete(ws);
     }
+
+    if (toRemove.length > 0) this.onInterestChanged?.();
   }
 
   /**

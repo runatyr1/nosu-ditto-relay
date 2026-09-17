@@ -118,6 +118,8 @@ const analyze = await createAnalyzer({
 let pendingFrames: Array<[id: number, frame: string]> = [];
 /** Accepted events awaiting fan-out, pre-serialized so main only moves strings. */
 let pendingAccepted: string[] = [];
+/** Kinds of `pendingAccepted`, positionally aligned, for main's interest routing. */
+let pendingAcceptedKinds: number[] = [];
 let outFlushScheduled = false;
 
 function scheduleOutFlush(): void {
@@ -139,9 +141,41 @@ function flushOut(): void {
     self.postMessage({
       t: "accepted",
       events: pendingAccepted,
+      kinds: pendingAcceptedKinds,
     } satisfies FromProtocolWorker);
     pendingAccepted = [];
+    pendingAcceptedKinds = [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// Subscription-interest reporting
+// ---------------------------------------------------------------------------
+
+/**
+ * Tell main which kinds this worker can match, so it can skip fanning
+ * events out to workers that would only parse and discard them.
+ *
+ * Coalesced onto a microtask: the hook fires on every REQ and CLOSE, and a
+ * burst of REQs from one batch should produce one summary, not dozens.
+ * Until the first report lands main assumes catch-all, so the window
+ * between a REQ and the report costs redundant broadcasts, never missed
+ * ones.
+ */
+let interestReportScheduled = false;
+
+function reportInterest(): void {
+  if (interestReportScheduled) return;
+  interestReportScheduled = true;
+  queueMicrotask(() => {
+    interestReportScheduled = false;
+    const { kinds, catchAll } = relay.subscriptionInterest();
+    self.postMessage({
+      t: "interest",
+      kinds,
+      catchAll,
+    } satisfies FromProtocolWorker);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -170,8 +204,10 @@ const relay = new Relay(storage, {
     // sibling workers, which parse it. Structured-cloning the event object
     // would make main re-serialize it once per sibling.
     pendingAccepted.push(JSON.stringify(event));
+    pendingAcceptedKinds.push(event.kind);
     scheduleOutFlush();
   },
+  onInterestChanged: reportInterest,
   relayInfo: {
     pubkey: config.relayPubkey,
     contact: config.relayContact,

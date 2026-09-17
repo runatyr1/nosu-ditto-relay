@@ -550,14 +550,83 @@ export const jsHeapUsedGauge = new Gauge({
 });
 
 /**
+ * Number of virtual memory areas (mappings) held by the process.
+ *
+ * This is a hard wall, not a soft one: at `vm.max_map_count` every mmap and
+ * mprotect that would split a VMA fails with ENOMEM, and JSC's collector
+ * spins retrying them. The process pins every core, stops serving, and
+ * never recovers. JSC decommits heap blocks with madvise, which splits
+ * adjacent same-permission mappings that the kernel then cannot merge, so
+ * the count grows with allocation churn rather than with live heap — RSS
+ * looks fine right up until the wall. All protocol workers share one
+ * address space and therefore one budget, so the count scales with
+ * PROTOCOL_WORKERS.
+ *
+ * Alert on `ditto_process_vma_count / ditto_process_vma_limit > 0.7`.
+ */
+export const processVmaCountGauge = new Gauge({
+  name: "ditto_process_vma_count",
+  help: "Virtual memory areas mapped by the relay process",
+});
+
+/** The kernel's `vm.max_map_count` — the ceiling for the gauge above. */
+export const processVmaLimitGauge = new Gauge({
+  name: "ditto_process_vma_limit",
+  help: "Kernel vm.max_map_count limit on virtual memory areas",
+});
+
+/**
+ * Count lines in /proc/self/maps by streaming it.
+ *
+ * Deliberately not `readFileSync`: this file is ~50 bytes per mapping, so a
+ * process about to hit the limit produces a 25 MB read. Materialising that
+ * as a string to `split("\n")` would add megabytes of garbage to a heap
+ * that is already the problem being measured.
+ */
+async function readVmaCount(): Promise<number | undefined> {
+  try {
+    const { createReadStream } = await import("node:fs");
+    return await new Promise<number>((resolve, reject) => {
+      let lines = 0;
+      // No encoding set, so chunks arrive as Buffers — which are
+      // Uint8Arrays, countable bytewise without decoding to a string.
+      const stream = createReadStream("/proc/self/maps");
+      stream.on("data", (chunk: Uint8Array | string) => {
+        if (typeof chunk === "string") return; // unreachable without encoding
+        for (let i = 0; i < chunk.length; i++) {
+          if (chunk[i] === 0x0a) lines++;
+        }
+      });
+      stream.on("end", () => resolve(lines));
+      stream.on("error", reject);
+    });
+  } catch {
+    return undefined; // not Linux, or /proc not mounted
+  }
+}
+
+/** Read `vm.max_map_count`, or undefined where /proc is unavailable. */
+async function readVmaLimit(): Promise<number | undefined> {
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const raw = await readFile("/proc/sys/vm/max_map_count", "utf8");
+    const n = Number.parseInt(raw.trim(), 10);
+    return Number.isFinite(n) ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Start sampling runtime health metrics. The lag gauge measures how much
  * later than scheduled each tick fires — a direct signal of event-loop
  * saturation on whatever thread this runs on. Returns a function that
  * stops sampling.
  *
- * @param opts.memory Sample RSS/heap too. Only the main thread should do
- *   this: `process.memoryUsage()` is process-wide, so per-worker samples
- *   would just duplicate the same number under every worker label.
+ * @param opts.memory Sample RSS/heap/VMA count too. Only the main thread
+ *   should do this: `process.memoryUsage()` and /proc/self are
+ *   process-wide, so per-worker samples would just duplicate the same
+ *   number under every worker label.
  */
 export function startRuntimeMetrics(
   intervalMs = 5_000,
@@ -577,5 +646,38 @@ export function startRuntimeMetrics(
     }
   }, intervalMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+
+  if (!memory) {
+    return () => clearInterval(timer);
+  }
+
+  // Sampled on its own slower timer: /proc/self/maps is O(mappings) to
+  // read, and the reader gets most expensive exactly when the process is
+  // in trouble. 30s is ample for a number that took 13 days to climb.
+  let vmaInFlight = false;
+  const vmaTimer = setInterval(() => {
+    if (vmaInFlight) return;
+    vmaInFlight = true;
+    readVmaCount()
+      .then((count) => {
+        if (count !== undefined) processVmaCountGauge.set(count);
+      })
+      .catch(() => {})
+      .finally(() => {
+        vmaInFlight = false;
+      });
+  }, 30_000);
+  vmaTimer.unref?.();
+
+  // The limit is a boot-time constant; read it once.
+  readVmaLimit()
+    .then((limit) => {
+      if (limit !== undefined) processVmaLimitGauge.set(limit);
+    })
+    .catch(() => {});
+
+  return () => {
+    clearInterval(timer);
+    clearInterval(vmaTimer);
+  };
 }

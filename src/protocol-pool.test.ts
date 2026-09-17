@@ -232,6 +232,69 @@ describe("ProtocolPool", () => {
     );
   });
 
+  it("fans out to a catch-all subscriber on another worker", async () => {
+    // A filter with no `kinds` can match anything, so the pool must keep
+    // sending that worker every accepted event even though its reported
+    // kind set is empty.
+    pool.open(221);
+    pool.open(222);
+
+    pool.message(221, JSON.stringify(["REQ", "all", { limit: 0 }]));
+    await until(() =>
+      (frames.get(221) ?? []).some((f) => f[0] === "EOSE" && f[1] === "all"),
+    );
+
+    const event = createEvent({ kind: 20002, content: "catch-all ping" });
+    pool.message(222, JSON.stringify(["EVENT", event]));
+
+    await until(() =>
+      (frames.get(221) ?? []).some(
+        (f) =>
+          f[0] === "EVENT" &&
+          f[1] === "all" &&
+          (f[2] as NostrEvent).id === event.id,
+      ),
+    );
+  });
+
+  it("follows interest across CLOSE and re-subscribe", async () => {
+    // Guards the interest-routing state in the pool: after dropping a
+    // subscription and taking a new one for a different kind, fan-out has
+    // to track the new kind — and a worker whose only subscription was
+    // closed must not go on receiving the old kind's events forever.
+    pool.open(231);
+    pool.open(232);
+
+    pool.message(231, JSON.stringify(["REQ", "s1", { kinds: [20003] }]));
+    await until(() =>
+      (frames.get(231) ?? []).some((f) => f[0] === "EOSE" && f[1] === "s1"),
+    );
+
+    pool.message(231, JSON.stringify(["CLOSE", "s1"]));
+    pool.message(231, JSON.stringify(["REQ", "s2", { kinds: [20004] }]));
+    await until(() =>
+      (frames.get(231) ?? []).some((f) => f[0] === "EOSE" && f[1] === "s2"),
+    );
+
+    const event = createEvent({ kind: 20004, content: "after resubscribe" });
+    pool.message(232, JSON.stringify(["EVENT", event]));
+
+    await until(() =>
+      (frames.get(231) ?? []).some(
+        (f) =>
+          f[0] === "EVENT" &&
+          f[1] === "s2" &&
+          (f[2] as NostrEvent).id === event.id,
+      ),
+    );
+
+    // The closed subscription must not receive anything.
+    assert.ok(
+      !(frames.get(231) ?? []).some((f) => f[0] === "EVENT" && f[1] === "s1"),
+      "closed subscription still received events",
+    );
+  });
+
   it("stores a valid EVENT through the indexer worker (OK true)", async () => {
     // Kind 1 goes through the full write path: protocol worker verifies,
     // then RPCs the indexer over its MessageChannel port; the indexer's

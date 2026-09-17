@@ -58,8 +58,19 @@ export type ToProtocolWorker =
 export type FromProtocolWorker =
   | { t: "ready"; relayInfo: NostrRelayInfo }
   | { t: "frames"; frames: Array<[id: number, frame: string]> }
-  /** Serialized NostrEvent JSON strings (stringified by the origin worker). */
-  | { t: "accepted"; events: string[] }
+  /**
+   * Serialized NostrEvent JSON strings (stringified by the origin worker),
+   * with each event's kind in the parallel `kinds` array so main can route
+   * by kind without parsing. Parallel arrays rather than an array of pairs:
+   * one fewer object per accepted event on the busiest path there is.
+   */
+  | { t: "accepted"; events: string[]; kinds: number[] }
+  /**
+   * The kinds this worker currently has live subscriptions for. Replaces
+   * the previous summary wholesale. `catchAll` means at least one filter
+   * omits `kinds` entirely, so the worker must receive every event.
+   */
+  | { t: "interest"; kinds: number[]; catchAll: boolean }
   | { t: "metrics"; reqId: number; text: string };
 
 /** Dirty-reference batch drained from a worker's storage layer. */
@@ -96,6 +107,13 @@ export class ProtocolPool {
   /** Per-worker inbound message batches awaiting flush. */
   private queues: Array<Array<[id: number, data: string]>>;
   private flushScheduled = false;
+  /**
+   * Kinds each worker has live subscriptions for, used to skip fan-out to
+   * workers that could not possibly match. Starts as catchAll so a worker
+   * that has not reported yet receives everything — missing a broadcast is
+   * a correctness bug, sending a redundant one is only waste.
+   */
+  private workerInterest: Array<{ kinds: Set<number>; catchAll: boolean }>;
 
   /** Pending /metrics round trips, keyed by request id. */
   private metricsPending = new Map<
@@ -150,6 +168,10 @@ export class ProtocolPool {
 
     this.connCounts = new Array(size).fill(0);
     this.queues = Array.from({ length: size }, () => []);
+    this.workerInterest = Array.from({ length: size }, () => ({
+      kinds: new Set<number>(),
+      catchAll: true,
+    }));
     this.workers = new Array(size);
     this.workerReady = new Array(size);
 
@@ -215,16 +237,16 @@ export class ProtocolPool {
           }
           break;
         case "accepted":
-          // Fan accepted events out to every *other* worker for broadcast
-          // matching against their connections' subscriptions.
-          for (let i = 0; i < this.workers.length; i++) {
-            if (i === workerIndex) continue;
-            this.workers[i].postMessage({
-              t: "bcast",
-              events: msg.events,
-            } satisfies ToProtocolWorker);
-          }
+          this.fanOutAccepted(workerIndex, msg.events, msg.kinds);
           break;
+        case "interest": {
+          const interest = this.workerInterest[workerIndex];
+          if (!interest) break;
+          interest.catchAll = msg.catchAll;
+          interest.kinds.clear();
+          for (const kind of msg.kinds) interest.kinds.add(kind);
+          break;
+        }
         case "metrics": {
           const pending = this.metricsPending.get(msg.reqId);
           if (pending) {
@@ -290,6 +312,9 @@ export class ProtocolPool {
     }
     this.connCounts[workerIndex] = 0;
     this.queues[workerIndex] = [];
+    // The replacement starts with no subscriptions, but reset to catchAll
+    // until it says otherwise — see the field docs.
+    this.workerInterest[workerIndex] = { kinds: new Set(), catchAll: true };
 
     this.log.error("protocol_worker_died", {
       worker: workerIndex,
@@ -420,9 +445,54 @@ export class ProtocolPool {
   }
 
   /**
+   * Fan accepted events out to the other workers for broadcast matching.
+   *
+   * Only workers with a live subscription for an event's kind (or a
+   * catch-all filter) receive it. The cost of a broadcast is paid by the
+   * *receiving* worker — a JSON.parse into a full event object with its
+   * tags — so a worker that cannot match the kind was previously doing
+   * that work only to discard the result. With N workers every accepted
+   * event cost N-1 parses regardless of interest; now it costs one per
+   * genuinely interested worker.
+   *
+   * Main never parses: kinds ride alongside the strings from the origin
+   * worker, which had the event in hand already.
+   */
+  private fanOutAccepted(
+    originIndex: number,
+    events: string[],
+    kinds: number[],
+  ): void {
+    for (let i = 0; i < this.workers.length; i++) {
+      if (i === originIndex) continue;
+      const interest = this.workerInterest[i];
+
+      let subset: string[];
+      if (interest.catchAll) {
+        subset = events;
+      } else {
+        subset = [];
+        for (let j = 0; j < events.length; j++) {
+          if (interest.kinds.has(kinds[j])) subset.push(events[j]);
+        }
+        if (subset.length === 0) continue; // nothing this worker can match
+      }
+
+      this.workers[i].postMessage({
+        t: "bcast",
+        events: subset,
+      } satisfies ToProtocolWorker);
+    }
+  }
+
+  /**
    * Inject events from outside the pool (bg stats worker) into every worker,
    * as serialized NostrEvent JSON. The bg worker pre-stringifies, so this is
    * a verbatim forward — no serialization on the main thread.
+   *
+   * Not interest-filtered: these arrive without kinds attached, and the
+   * volume (NIP-85 stats, trend labels) is negligible next to the ingest
+   * path.
    */
   broadcastExternal(events: string[]): void {
     for (const worker of this.workers) {

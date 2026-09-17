@@ -1997,6 +1997,66 @@ describe("Relay", () => {
       return { ws, messages };
     }
 
+    describe("subscriptionInterest", () => {
+      it("reports the kinds of live subscriptions", async () => {
+        const sub = createMockWs();
+        relay.handleOpen(sub.ws);
+        mockStorage.query = async () => [];
+        await relay.handleReq(sub.ws, "s1", [
+          { kinds: [1, 7] },
+          { kinds: [4] },
+        ]);
+
+        const interest = relay.subscriptionInterest();
+        assert.deepEqual(
+          interest.kinds.sort((a, b) => a - b),
+          [1, 4, 7],
+        );
+        assert.equal(interest.catchAll, false);
+      });
+
+      it("reports catchAll for a filter with no kinds", async () => {
+        const sub = createMockWs();
+        relay.handleOpen(sub.ws);
+        mockStorage.query = async () => [];
+        await relay.handleReq(sub.ws, "s1", [{ authors: ["deadbeef"] }]);
+
+        assert.equal(relay.subscriptionInterest().catchAll, true);
+      });
+
+      it("drops kinds when the subscription closes", async () => {
+        const sub = createMockWs();
+        relay.handleOpen(sub.ws);
+        mockStorage.query = async () => [];
+        await relay.handleReq(sub.ws, "s1", [{ kinds: [1] }]);
+        assert.deepEqual(relay.subscriptionInterest().kinds, [1]);
+
+        relay.handleClose(sub.ws, "s1");
+        assert.deepEqual(relay.subscriptionInterest().kinds, []);
+        assert.equal(relay.subscriptionInterest().catchAll, false);
+      });
+
+      it("fires onInterestChanged on subscribe and close", async () => {
+        let fired = 0;
+        const local = new Relay(mockStorage, {
+          relayUrl: "wss://relay.example.com/",
+          onInterestChanged: () => {
+            fired++;
+          },
+        });
+        const sub = createMockWs();
+        local.handleOpen(sub.ws);
+        mockStorage.query = async () => [];
+
+        await local.handleReq(sub.ws, "s1", [{ kinds: [1] }]);
+        const afterReq = fired;
+        assert.ok(afterReq > 0, "hook did not fire on REQ");
+
+        local.handleClose(sub.ws, "s1");
+        assert.ok(fired > afterReq, "hook did not fire on CLOSE");
+      });
+    });
+
     it("should broadcast event to matching subscription on another connection", async () => {
       // Subscriber
       const sub = createMockWs();
