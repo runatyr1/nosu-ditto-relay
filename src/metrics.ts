@@ -576,6 +576,16 @@ export const processVmaLimitGauge = new Gauge({
 });
 
 /**
+ * Times `process.memoryUsage()` threw and the sample was dropped. Non-zero
+ * means the RSS and heap gauges have gaps; it does not mean the relay is
+ * unhealthy.
+ */
+export const memorySampleFailures = new Counter({
+  name: "ditto_memory_sample_failures_total",
+  help: "Runtime memory samples skipped because process.memoryUsage() threw",
+});
+
+/**
  * Count lines in /proc/self/maps by streaming it.
  *
  * Deliberately not `readFileSync`: this file is ~50 bytes per mapping, so a
@@ -640,9 +650,18 @@ export function startRuntimeMetrics(
     expected = now + intervalMs;
 
     if (memory) {
-      const mem = process.memoryUsage();
-      processRssGauge.set(mem.rss);
-      jsHeapUsedGauge.set(mem.heapUsed);
+      // process.memoryUsage() can throw (Bun raises SystemError "Failed to
+      // get memory usage" on this host). An unhandled throw in a timer
+      // callback is an uncaught exception and takes the whole relay down,
+      // which is an absurd way to lose a server: the sample is
+      // observability, not load-bearing. Skip it and take the next one.
+      try {
+        const mem = process.memoryUsage();
+        processRssGauge.set(mem.rss);
+        jsHeapUsedGauge.set(mem.heapUsed);
+      } catch {
+        memorySampleFailures.inc();
+      }
     }
   }, intervalMs);
   timer.unref?.();

@@ -1,7 +1,12 @@
 import { strict as assert } from "node:assert";
+import process from "node:process";
 import { describe, it } from "node:test";
 
-import { mergeExposition } from "./metrics.ts";
+import {
+  memorySampleFailures,
+  mergeExposition,
+  startRuntimeMetrics,
+} from "./metrics.ts";
 
 describe("mergeExposition", () => {
   it("groups samples from multiple threads under one HELP/TYPE header", () => {
@@ -87,5 +92,47 @@ describe("mergeExposition", () => {
     assert.ok(
       merged.includes('ditto_relay_req_duration_seconds_sum{worker="1"} 0.5'),
     );
+  });
+});
+
+describe("startRuntimeMetrics", () => {
+  it("survives process.memoryUsage() throwing", async () => {
+    // Regression: the throw used to escape the timer callback as an
+    // uncaught exception and kill the relay. Bun raises SystemError
+    // "Failed to get memory usage" on the production LXC host.
+    /** Read the counter's unlabelled value out of its exposition text. */
+    const failures = (): number => {
+      const line = memorySampleFailures
+        .serialize()
+        .split("\n")
+        .find((l) => l.startsWith("ditto_memory_sample_failures_total "));
+      return line ? Number(line.split(" ")[1]) : 0;
+    };
+
+    const original = process.memoryUsage;
+    const before = failures();
+    let calls = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: test stub
+    (process as any).memoryUsage = () => {
+      calls++;
+      throw new Error("Failed to get memory usage");
+    };
+
+    let stop: (() => void) | undefined;
+    try {
+      stop = startRuntimeMetrics(5, { memory: true });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    } finally {
+      stop?.();
+      process.memoryUsage = original;
+    }
+
+    assert.ok(calls > 0, "stub was never called");
+    assert.ok(failures() > before, "failure counter did not advance");
+  });
+
+  it("stops both timers when the returned disposer runs", () => {
+    const stop = startRuntimeMetrics(5, { memory: true });
+    assert.doesNotThrow(() => stop());
   });
 });
