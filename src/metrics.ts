@@ -674,26 +674,25 @@ export function startRuntimeMetrics(
   // read, and the reader gets most expensive exactly when the process is
   // in trouble. 30s is ample for a number that took 13 days to climb.
   let vmaInFlight = false;
-  const vmaTimer = setInterval(() => {
+  const sampleVma = (): void => {
     if (vmaInFlight) return;
     vmaInFlight = true;
-    readVmaCount()
-      .then((count) => {
+    // The limit is re-read with the count, not cached at startup: it is a
+    // live sysctl an operator can raise without restarting the relay, and
+    // a stale value silently scales every alert built on the ratio.
+    Promise.all([readVmaCount(), readVmaLimit()])
+      .then(([count, limit]) => {
         if (count !== undefined) processVmaCountGauge.set(count);
+        if (limit !== undefined) processVmaLimitGauge.set(limit);
       })
       .catch(() => {})
       .finally(() => {
         vmaInFlight = false;
       });
-  }, 30_000);
+  };
+  const vmaTimer = setInterval(sampleVma, 30_000);
   vmaTimer.unref?.();
-
-  // The limit is a boot-time constant; read it once.
-  readVmaLimit()
-    .then((limit) => {
-      if (limit !== undefined) processVmaLimitGauge.set(limit);
-    })
-    .catch(() => {});
+  sampleVma(); // don't leave the gauges absent for the first 30s
 
   return () => {
     clearInterval(timer);

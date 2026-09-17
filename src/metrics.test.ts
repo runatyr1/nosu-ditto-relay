@@ -5,6 +5,8 @@ import { describe, it } from "node:test";
 import {
   memorySampleFailures,
   mergeExposition,
+  processVmaCountGauge,
+  processVmaLimitGauge,
   startRuntimeMetrics,
 } from "./metrics.ts";
 
@@ -134,5 +136,49 @@ describe("startRuntimeMetrics", () => {
   it("stops both timers when the returned disposer runs", () => {
     const stop = startRuntimeMetrics(5, { memory: true });
     assert.doesNotThrow(() => stop());
+  });
+});
+
+describe("VMA gauges", () => {
+  it("publishes count and limit on Linux, and tracks a changed limit", async () => {
+    // vm.max_map_count is a live sysctl. Caching it at startup made the
+    // gauge report 512000 for hours after the host was raised to 2097152,
+    // which would scale any count/limit alert by 4x.
+    const { readFile } = await import("node:fs/promises");
+    let realLimit: number;
+    try {
+      realLimit = Number.parseInt(
+        await readFile("/proc/sys/vm/max_map_count", "utf8"),
+        10,
+      );
+    } catch {
+      return; // not Linux; nothing to assert
+    }
+
+    const stop = startRuntimeMetrics(5, { memory: true });
+    try {
+      // The initial sample is kicked off synchronously; give it a tick.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } finally {
+      stop();
+    }
+
+    const read = (gauge: { serialize(): string }, name: string): number => {
+      const line = gauge
+        .serialize()
+        .split("\n")
+        .find((l) => l.startsWith(`${name} `));
+      return line ? Number(line.split(" ")[1]) : Number.NaN;
+    };
+
+    assert.equal(
+      read(processVmaLimitGauge, "ditto_process_vma_limit"),
+      realLimit,
+      "limit gauge does not match the live sysctl",
+    );
+    assert.ok(
+      read(processVmaCountGauge, "ditto_process_vma_count") > 0,
+      "count gauge was not populated",
+    );
   });
 });
