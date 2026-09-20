@@ -107,7 +107,7 @@ describe("ProtocolPool", () => {
       },
       workerEnv: {
         RELAY_URL: "wss://relay.test/",
-        NOSTR_NSEC: nip19.nsecEncode(generateSecretKey()),
+        NOSTR_SECRET_KEY: nip19.nsecEncode(generateSecretKey()),
         OPENSEARCH_NODE: `http://localhost:${mockOpenSearch.port}`,
         LOG_LEVEL: "error",
         STATS_ENABLED: "false",

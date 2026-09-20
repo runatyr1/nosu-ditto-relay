@@ -2,12 +2,12 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { Config } from "./config.ts";
 
-/** Minimum env required to construct a Config (RELAY_URL and NOSTR_NSEC are mandatory). */
+/** Minimum env required to construct a Config (RELAY_URL and NOSTR_SECRET_KEY are mandatory). */
 function baseEnv(overrides?: [string, string][]): Map<string, string> {
   const entries: [string, string][] = [
     ["RELAY_URL", "wss://relay.example.com/"],
     [
-      "NOSTR_NSEC",
+      "NOSTR_SECRET_KEY",
       "nsec1l2xejwnzu9sjl9ve3eryktge5u05esdez9ll3wt9gly9n7yraq4sph4kgh",
     ],
     ...(overrides ?? []),
@@ -94,7 +94,7 @@ describe("Config", () => {
     it("should throw an error when RELAY_URL is not set", () => {
       const mockEnv = new Map([
         [
-          "NOSTR_NSEC",
+          "NOSTR_SECRET_KEY",
           "nsec1l2xejwnzu9sjl9ve3eryktge5u05esdez9ll3wt9gly9n7yraq4sph4kgh",
         ],
       ]);
@@ -108,9 +108,9 @@ describe("Config", () => {
   });
 
   describe("nostrSigner", () => {
-    it("should throw an error when NOSTR_NSEC is not set", () => {
+    it("should throw an error when NOSTR_SECRET_KEY is not set", () => {
       const mockEnv = new Map([["RELAY_URL", "wss://relay.example.com/"]]);
-      assert.throws(() => new Config(mockEnv), /NOSTR_NSEC is required/);
+      assert.throws(() => new Config(mockEnv), /NOSTR_SECRET_KEY is required/);
     });
 
     it("should return a NostrSigner when a valid nsec is provided", async () => {
@@ -121,11 +121,44 @@ describe("Config", () => {
       assert.equal(pubkey.length, 64);
     });
 
-    it("should throw an error when the value is not an nsec", () => {
+    it("should fall back to NOSTR_NSEC when NOSTR_SECRET_KEY is not set", async () => {
       const mockEnv = new Map([
         ["RELAY_URL", "wss://relay.example.com/"],
         [
           "NOSTR_NSEC",
+          "nsec1l2xejwnzu9sjl9ve3eryktge5u05esdez9ll3wt9gly9n7yraq4sph4kgh",
+        ],
+      ]);
+      const pubkey = await new Config(mockEnv).nostrSigner.getPublicKey();
+      assert.equal(pubkey.length, 64);
+    });
+
+    it("should prefer NOSTR_SECRET_KEY over NOSTR_NSEC", async () => {
+      const preferred = await new Config(
+        baseEnv([
+          [
+            "NOSTR_NSEC",
+            "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+          ],
+        ]),
+      ).nostrSigner.getPublicKey();
+      const fallbackOnly = await new Config(
+        new Map([
+          ["RELAY_URL", "wss://relay.example.com/"],
+          [
+            "NOSTR_NSEC",
+            "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+          ],
+        ]),
+      ).nostrSigner.getPublicKey();
+      assert.notEqual(preferred, fallbackOnly);
+    });
+
+    it("should throw an error when the value is not an nsec", () => {
+      const mockEnv = new Map([
+        ["RELAY_URL", "wss://relay.example.com/"],
+        [
+          "NOSTR_SECRET_KEY",
           "npub1dpyfqvgf6cup9cx3tdnqrh0h33alsey5rtu34976sgxrag3286aqgnlshp",
         ],
       ]);

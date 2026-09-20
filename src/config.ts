@@ -585,15 +585,15 @@ export class Config {
       this.protocolWorkers = n;
     }
 
-    // nostrSigner
-    const nsecValue = env.get("NOSTR_NSEC");
+    // nostrSigner. NOSTR_NSEC is the former name, still honored as a fallback.
+    const nsecValue = env.get("NOSTR_SECRET_KEY") || env.get("NOSTR_NSEC");
     if (!nsecValue) {
-      throw new Error("NOSTR_NSEC is required.");
+      throw new Error("NOSTR_SECRET_KEY is required.");
     }
     const decoded = nip19.decode(nsecValue);
     if (decoded.type !== "nsec") {
       throw new Error(
-        "NOSTR_NSEC must be a valid nsec (bech32-encoded secret key).",
+        "NOSTR_SECRET_KEY must be a valid nsec (bech32-encoded secret key).",
       );
     }
     this.nostrSigner = new NSecSigner(decoded.data);

@@ -423,12 +423,12 @@ describe("OpenSearchRelay", () => {
     };
   };
 
-  /** Minimum env required to construct a Config (RELAY_URL and NOSTR_NSEC are mandatory). */
+  /** Minimum env required to construct a Config (RELAY_URL and NOSTR_SECRET_KEY are mandatory). */
   const baseEnv = (...overrides: [string, string][]): Map<string, string> =>
     new Map<string, string>([
       ["RELAY_URL", "wss://relay.example.com/"],
       [
-        "NOSTR_NSEC",
+        "NOSTR_SECRET_KEY",
         "nsec1l2xejwnzu9sjl9ve3eryktge5u05esdez9ll3wt9gly9n7yraq4sph4kgh",
       ],
       ...overrides,
@@ -9868,7 +9868,7 @@ describe("OpenSearchRelay.seedDirtyEngaged", () => {
           new Map<string, string>([
             ["RELAY_URL", "wss://relay.example.com/"],
             [
-              "NOSTR_NSEC",
+              "NOSTR_SECRET_KEY",
               "nsec1l2xejwnzu9sjl9ve3eryktge5u05esdez9ll3wt9gly9n7yraq4sph4kgh",
             ],
             ...overrides,

@@ -223,7 +223,7 @@ PORT=8000
 RELAY_URL=wss://relay.example.com/
 RELAY_PUBKEY=<hex pubkey>
 RELAY_CONTACT=admin@example.com
-NOSTR_NSEC=<nsec, signs trends and NIP-85 events>
+NOSTR_SECRET_KEY=<nsec, signs trends and NIP-85 events>
 
 # OpenSearch
 OPENSEARCH_NODE=http://localhost:9200
@@ -241,7 +241,7 @@ All options:
 | `PUBLIC_URL` | Public HTTP URL, used for icon/banner links | derived from `RELAY_URL` |
 | `RELAY_PUBKEY` | Operator pubkey (hex) for NIP-11 | unset |
 | `RELAY_CONTACT` | Operator contact for NIP-11 | unset |
-| `NOSTR_NSEC` | Relay signing key for trends and NIP-85 events (required) | — |
+| `NOSTR_SECRET_KEY` | Relay signing key (nsec) for trends and NIP-85 events (required; falls back to the former `NOSTR_NSEC`) | — |
 | `OPENSEARCH_NODE` | OpenSearch endpoint | `http://localhost:9200` |
 | `OPENSEARCH_INDEX` | Index name | `nostr-events` |
 | `OPENSEARCH_USERNAME` | OpenSearch basic-auth username | unset |
@@ -294,7 +294,7 @@ OpenSearch, which is the quickest way to self-host:
 
 ```bash
 cp .env.example .env
-# Set at least RELAY_URL and NOSTR_NSEC — the relay refuses to start without them.
+# Set at least RELAY_URL and NOSTR_SECRET_KEY — the relay refuses to start without them.
 docker compose up -d
 docker compose logs -f relay
 ```
