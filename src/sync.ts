@@ -164,7 +164,8 @@ export class SyncEngine {
   }
   async transferWindow(window: Window, filter: Filter = {}, source = this.peer, destination = this.local, authenticated = false, cancelled = () => false, publicKind?: PublicJob["kind"]) {
     const metrics = publicKind ? this.jobMetrics[publicKind] : undefined;
-    const scoped = { ...filter, ...window };
+    // Job metadata is local bookkeeping, never part of a Nostr filter.
+    const scoped = { ...filter, since: window.since, until: window.until };
     const items = await this.store.queryItems(scoped, { maxItems: this.config.maxItems, signal: AbortSignal.timeout(60000), includeAuthKinds: authenticated });
     if (metrics) metrics.reconciliations++;
     const { need: ids } = await source.reconcile(scoped, items);

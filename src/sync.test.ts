@@ -150,6 +150,7 @@ describe("native WebSocket reconciliation and transfers", () => {
       websocket: { message(ws, message) {
         const frame = JSON.parse(String(message));
         if (frame[0] === "NEG-OPEN") {
+          assert.deepEqual(Object.keys(frame[2]).sort(), ["since", "until"]);
           const vector = new NegentropyStorageVector(); for (const event of remote) vector.insertHex(event.created_at, event.id); vector.seal();
           const neg = new Negentropy(vector, 16384); sessions.set(frame[1], neg);
           const result = neg.reconcile(hexToBytes(frame[3])); ws.send(JSON.stringify(["NEG-MSG", frame[1], bytesToHex(result.message!)]));
@@ -169,9 +170,11 @@ describe("native WebSocket reconciliation and transfers", () => {
     const engine = new SyncEngine(config, { queryItems: async () => [...local.values()].map(event => ({ id: event.id, created_at: event.created_at })) }, "/tmp/unused-sync-test");
     try {
       await Promise.all([engine.peer.connect(), engine.local.connect()]);
-      await engine.transferWindow({ since: now - 1, until: now });
+      const job = { kind: "catchup" as const, since: now - 1, until: now };
+      await engine.transferWindow(job, {}, engine.peer, engine.local, false, () => false, job.kind);
       assert.equal(local.size, 60); assert.deepEqual(batches, [25, 25, 10]);
-      await engine.transferWindow({ since: now - 1, until: now }); assert.equal(batches.length, 3);
+      assert.equal(engine.status().catchup.accepted, 60); assert.equal(engine.status().backfill.accepted, 0);
+      await engine.transferWindow(job, {}, engine.peer, engine.local, false, () => false, job.kind); assert.equal(batches.length, 3);
     } finally { engine.stop(); server.stop(true); }
   });
 });
