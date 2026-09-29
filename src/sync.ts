@@ -48,8 +48,8 @@ export class SyncEngine {
   private liveError: string | null = null;
   readonly liveMetrics = { received: 0, accepted: 0, rejected: 0, overflows: 0, recoveredAt: null as string | null };
   readonly jobMetrics = {
-    catchup: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, receivedBytes: 0, lastError: null as string | null },
-    backfill: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, receivedBytes: 0, lastError: null as string | null },
+    catchup: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, lastError: null as string | null },
+    backfill: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, lastError: null as string | null },
   };
   private channelSample = { at: Date.now(), liveReceived: 0, liveEvents: 0, catchupEvents: 0, backfillEvents: 0, liveBytes: 0, peerBytes: 0 };
   private channelRates = { liveReceived: 0, liveEvents: 0, catchupEvents: 0, backfillEvents: 0, liveBytes: 0, peerBytes: 0 };
