@@ -10,6 +10,7 @@ interface Session {
   token: string; pubkey: string; expiresAt: number; local: SyncSocket; peer: SyncSocket;
   challenges: Map<string, Challenge>; syncing: boolean; completed: boolean; error: string | null;
   queue: { event: NostrEvent; destination: SyncSocket }[]; stopping: boolean;
+  retryTimer?: ReturnType<typeof setTimeout>; retryDelayMs: number;
 }
 export function validateProof(event: NostrEvent, url: string, now = Date.now()) {
   if (!verifyEvent(event) || event.kind !== 27235 || Math.abs(now / 1000 - event.created_at) > 60 || event.content !== "") return false;
@@ -39,7 +40,8 @@ export class SyncSessions {
   status() { return { active: this.sessions.size, syncing: [...this.sessions.values()].filter((s) => s.syncing).length, completed: [...this.sessions.values()].filter((s) => s.completed).length, failed: [...this.sessions.values()].filter((s) => s.error).length }; }
   revoke(token: string) {
     const session = this.sessions.get(token); if (!session) return;
-    session.stopping = true; session.local.close(); session.peer.close(); this.sessions.delete(token);
+    session.stopping = true; if (session.retryTimer) clearTimeout(session.retryTimer);
+    session.local.close(); session.peer.close(); this.sessions.delete(token);
   }
   stop() { clearInterval(this.timer); for (const token of this.sessions.keys()) this.revoke(token); }
   async register(proof: NostrEvent) {
@@ -53,7 +55,7 @@ export class SyncSessions {
     const token = randomBytes(32).toString("hex");
     const session: Session = { token, pubkey: proof.pubkey, expiresAt: Date.now() + 3600000, local, peer,
       challenges: new Map(), syncing: false, completed: false, error: null,
-      queue: this.engine.userOutbox(proof.pubkey).map(event => ({ event, destination: peer })), stopping: false };
+      queue: this.engine.userOutbox(proof.pubkey).map(event => ({ event, destination: peer })), stopping: false, retryDelayMs: 30000 };
     const install = (socket: SyncSocket, relay: string) => {
       socket.onChallenge = (challenge) => {
         for (const [id, old] of session.challenges) if (old.socket === socket) session.challenges.delete(id);
@@ -125,8 +127,21 @@ export class SyncSessions {
       // Include protected public events authored here; the peer socket is authenticated as author.
       await session.local.subscribe("private-local", [...filters, { authors: [session.pubkey] }]);
       await this.engine.fullUserHistory(filters, session.peer, session.local, until, () => session.stopping);
-      session.completed = true;
-    } catch { session.error = "user history sync incomplete; relay access, admission, or connection failed"; }
+      session.completed = true; session.retryDelayMs = 30000;
+    } catch {
+      session.error = "user history sync incomplete; relay access, admission, or connection failed";
+      if (!session.stopping && session.expiresAt > Date.now()) {
+        const delayMs = session.retryDelayMs;
+        session.retryDelayMs = Math.min(300000, delayMs * 2);
+        const retry = () => {
+          if (session.stopping || session.expiresAt <= Date.now()) return;
+          if (this.engine.paused) { session.retryTimer = setTimeout(retry, 30000); return; }
+          // A disconnected socket requires fresh NIP-42 challenges through a new browser session.
+          if (session.local.connected && session.peer.connected && session.local.authenticated && session.peer.authenticated) void this.sync(session);
+        };
+        session.retryTimer = setTimeout(retry, delayMs);
+      }
+    }
     finally { session.syncing = false; }
   }
   private async liveLoop(session: Session) {

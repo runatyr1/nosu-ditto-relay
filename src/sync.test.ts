@@ -6,7 +6,7 @@ import { splitWindow, Regulator } from "./sync-protocol.ts";
 import { SyncEngine } from "./sync.ts";
 import { Negentropy, NegentropyStorageVector, bytesToHex, hexToBytes } from "./negentropy.ts";
 import type { NostrEvent } from "nostr-tools";
-import { validateAuth, validateProof } from "./sync-sessions.ts";
+import { SyncSessions, validateAuth, validateProof } from "./sync-sessions.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -90,6 +90,34 @@ describe("live recovery diagnostics", () => {
     assert.equal(status.phase, "attention");
     engine.lastError = null;
     assert.equal(engine.status().lastError, null);
+  });
+});
+
+describe("private history recovery", () => {
+  it("retries a transient history failure on the same authenticated session", async () => {
+    let attempts = 0;
+    const socket = () => ({ connected: true, authenticated: true, subscribe: async () => {}, close: () => {} });
+    const engine = {
+      config: { peers: ["wss://relay.ditto.pub/"] }, paused: false,
+      fullUserHistory: async () => { if (++attempts === 1) throw new Error("temporary relay refusal"); },
+    } as unknown as SyncEngine;
+    const sessions = new SyncSessions(engine, "http://localhost/relay-sync", "http://localhost");
+    const token = "test";
+    const session = {
+      token, pubkey: "a".repeat(64), expiresAt: Date.now() + 60000,
+      local: socket(), peer: socket(), challenges: new Map(),
+      syncing: false, completed: false, error: null, queue: [], stopping: false,
+      retryDelayMs: 5,
+    };
+    // Exercise the session's timed recovery with local in-memory relay doubles.
+    (sessions as unknown as { sessions: Map<string, unknown> }).sessions.set(token, session);
+    try {
+      await (sessions as unknown as { sync: (value: unknown) => Promise<void> }).sync(session);
+      assert.ok(session.error); assert.equal(session.completed, false);
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+      assert.equal(attempts, 2); assert.equal(session.completed, true);
+      assert.equal(session.error, null);
+    } finally { sessions.stop(); }
   });
 });
 
