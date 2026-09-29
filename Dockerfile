@@ -29,6 +29,7 @@ COPY scripts ./scripts
 COPY public ./public
 
 # Unprivileged user shipped by the base image.
+RUN mkdir -p /data && chown bun:bun /data
 USER bun
 
 EXPOSE 13131
