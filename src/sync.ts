@@ -20,7 +20,8 @@ export function parseSyncConfig(value: unknown): SyncConfig {
   if (config.batchSize > 100 || config.batchSize > config.maxQueue || config.maxItems > 1000000) throw new Error("sync limits exceed supported bounds");
   return config;
 }
-interface State { version: 1; coverage: Window[]; pending: Window[]; outgoing: NostrEvent[]; privateOutgoing?: { pubkey: string; event: NostrEvent }[] }
+type PublicJob = Window & { kind: "catchup" | "backfill" };
+interface State { version: 1; coverage: Window[]; pending: PublicJob[]; backfillCompleted?: Window[]; outgoing: NostrEvent[]; privateOutgoing?: { pubkey: string; event: NostrEvent }[] }
 export interface ItemStore { queryItems(filter: Filter, options: { maxItems: number; signal: AbortSignal; includeAuthKinds?: boolean }): Promise<{ created_at: number; id: string }[]> }
 /** Merge only proven complete windows. Empty intervals still count as coverage. */
 export function mergeCoverage(windows: Window[]): Window[] {
@@ -36,9 +37,9 @@ export class SyncEngine {
   readonly counters: SyncCounters = { requests: 0, downloaded: 0, uploaded: 0, rejected: 0, retries: 0, bytes: 0, policySkipped: 0, missingAtTransfer: 0 };
   readonly requestGate: Regulator; readonly uploadGate: Regulator;
   readonly local: SyncSocket; readonly peer: SyncSocket; readonly livePeer: SyncSocket;
-  state: State = { version: 1, coverage: [], pending: [], outgoing: [] };
+  state: State = { version: 1, coverage: [], pending: [], backfillCompleted: [], outgoing: [] };
   paused = false; phase = "starting"; lastError: string | null = null; lastActivity: string | null = null;
-  activeWindow: Window | null = null;
+  activeWindow: PublicJob | null = null;
   private transfers = new Set<{ total: number; remaining: number }>();
   private stopped = false; private incoming: NostrEvent[] = []; private imported = new Set<string>();
   private sample = { at: Date.now(), requests: 0, events: 0, bytes: 0 };
@@ -46,9 +47,12 @@ export class SyncEngine {
   private writing = Promise.resolve(); private retryDelay = 1000;
   private liveError: string | null = null;
   readonly liveMetrics = { received: 0, accepted: 0, rejected: 0, overflows: 0, recoveredAt: null as string | null };
-  readonly historyMetrics = { accepted: 0, rejected: 0, unavailable: 0 };
-  private channelSample = { at: Date.now(), liveReceived: 0, liveEvents: 0, historyEvents: 0, liveBytes: 0, historyBytes: 0 };
-  private channelRates = { liveReceived: 0, liveEvents: 0, historyEvents: 0, liveBytes: 0, historyBytes: 0 };
+  readonly jobMetrics = {
+    catchup: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, receivedBytes: 0, lastError: null as string | null },
+    backfill: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, receivedBytes: 0, lastError: null as string | null },
+  };
+  private channelSample = { at: Date.now(), liveReceived: 0, liveEvents: 0, catchupEvents: 0, backfillEvents: 0, liveBytes: 0, peerBytes: 0 };
+  private channelRates = { liveReceived: 0, liveEvents: 0, catchupEvents: 0, backfillEvents: 0, liveBytes: 0, peerBytes: 0 };
   constructor(readonly config: SyncConfig, readonly store: ItemStore, readonly stateDir: string, readonly localSignerPubkey?: string) {
     this.requestGate = new Regulator(config.requestIntervalMs); this.uploadGate = new Regulator(config.uploadIntervalMs);
     this.local = new SyncSocket(config.localRelay, config, new Regulator(0), new Regulator(0), this.counters);
@@ -58,7 +62,7 @@ export class SyncEngine {
     this.livePeer.onEvent = (event, sub) => {
       if (sub !== "live-peer" || this.paused) return;
       this.liveMetrics.received++;
-      if (this.incoming.length >= config.maxQueue || queueBytes([...this.incoming, event]) > config.maxQueueBytes) { this.liveMetrics.overflows++; this.failLive(new CapacityError("Live queue full; draining before reconnect. Missed intervals await historical catch-up.")); this.livePeer.close(); return; }
+      if (this.incoming.length >= config.maxQueue || queueBytes([...this.incoming, event]) > config.maxQueueBytes) { this.liveMetrics.overflows++; this.failLive(new CapacityError("Live queue full; draining before reconnect. Missed intervals await live catch-up.")); this.livePeer.close(); return; }
       if (!this.imported.has(event.id)) this.incoming.push(event);
     };
     this.local.onEvent = (event, sub) => {
@@ -108,6 +112,13 @@ export class SyncEngine {
       if (saved.outgoing.length > this.config.maxQueue || queueBytes(saved.outgoing) > this.config.maxQueueBytes) throw new Error("persisted queue exceeds configured cap");
       if (saved.privateOutgoing && (!Array.isArray(saved.privateOutgoing) || saved.privateOutgoing.length > this.config.maxQueue || queueBytes(saved.privateOutgoing.map(item => item.event)) > this.config.maxQueueBytes)) throw new Error("persisted private queue exceeds configured cap");
       for (const window of [...saved.coverage, ...saved.pending]) if (!Number.isSafeInteger(window.since) || !Number.isSafeInteger(window.until) || window.since < 0 || window.since > window.until) throw new Error("invalid saved coverage");
+      // v1 windows predate job labels. Windows older than completed coverage
+      // were explicit backfills; forward gaps and the initial hour are catch-up.
+      const oldest = saved.coverage[0]?.since;
+      saved.pending = saved.pending.map(job => ({ ...job, kind: job.kind === "backfill" || (job.kind !== "catchup" && oldest !== undefined && job.until < oldest) ? "backfill" : "catchup" }));
+      saved.backfillCompleted ??= [];
+      if (!Array.isArray(saved.backfillCompleted)) throw new Error("invalid saved backfill coverage");
+      for (const window of saved.backfillCompleted) if (!Number.isSafeInteger(window.since) || !Number.isSafeInteger(window.until) || window.since < 0 || window.since > window.until) throw new Error("invalid saved backfill coverage");
       this.state = saved;
       // Relay-generated statistics remain local. Only client publications are
       // exported, including after loading an older persisted public queue.
@@ -115,7 +126,7 @@ export class SyncEngine {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       const until = Math.floor(Date.now() / 1000);
-      this.state.pending.push({ since: until - this.config.historySeconds + 1, until }); await this.save();
+      this.state.pending.push({ kind: "catchup", since: until - this.config.historySeconds + 1, until }); await this.save();
     }
   }
   save() {
@@ -128,12 +139,15 @@ export class SyncEngine {
   }
   async control(action: string) {
     if (action === "pause") { this.paused = true; this.phase = "paused"; this.peer.close(); this.livePeer.close(); this.local.close(); }
-    else if (action === "resume" || action === "retry") { this.paused = false; this.lastError = null; this.retryDelay = 1000; }
+    else if (action === "resume" || action === "retry") {
+      this.paused = false; this.lastError = null; this.retryDelay = 1000;
+      this.jobMetrics.catchup.lastError = null; this.jobMetrics.backfill.lastError = null;
+    }
     else if (action === "backfill") {
       if (!this.state.coverage.length || this.state.pending.length || this.activeWindow) throw new Error("finish current coverage before extending history");
       const oldest = Math.min(...this.state.coverage.map((window) => window.since));
       if (oldest === 0) throw new Error("history already reaches timestamp zero");
-      this.state.pending.push({ since: Math.max(0, oldest - this.config.historySeconds), until: oldest - 1 }); await this.save();
+      this.state.pending.push({ kind: "backfill", since: Math.max(0, oldest - this.config.historySeconds), until: oldest - 1 }); await this.save();
     } else throw new Error("unknown sync action");
   }
   async importEvent(event: NostrEvent, destination = this.local) {
@@ -148,10 +162,11 @@ export class SyncEngine {
     }
     catch (error) { this.counters.rejected++; throw error; }
   }
-  async transferWindow(window: Window, filter: Filter = {}, source = this.peer, destination = this.local, authenticated = false, cancelled = () => false) {
-    const publicHistory = source === this.peer && destination === this.local;
+  async transferWindow(window: Window, filter: Filter = {}, source = this.peer, destination = this.local, authenticated = false, cancelled = () => false, publicKind?: PublicJob["kind"]) {
+    const metrics = publicKind ? this.jobMetrics[publicKind] : undefined;
     const scoped = { ...filter, ...window };
     const items = await this.store.queryItems(scoped, { maxItems: this.config.maxItems, signal: AbortSignal.timeout(60000), includeAuthKinds: authenticated });
+    if (metrics) metrics.reconciliations++;
     const { need: ids } = await source.reconcile(scoped, items);
     const transfer = { total: ids.length, remaining: ids.length }; this.transfers.add(transfer);
     try {
@@ -159,24 +174,26 @@ export class SyncEngine {
       while (this.paused && !this.stopped && !cancelled()) await delay(250);
       if (this.stopped || cancelled()) throw new Error("sync stopped or revoked");
       const batch = ids.slice(offset, offset + this.config.batchSize);
+      if (metrics) metrics.queries++;
       const events = await source.query({ ...scoped, ids: batch, limit: batch.length });
       const returned = new Set(events.map((event) => event.id));
       const missing = batch.filter((id) => !returned.has(id));
       // Deletion/expiration can race reconciliation. Retry once before reporting
       // unavailable IDs explicitly; never discard a failed request as complete.
       if (missing.length) {
+        if (metrics) metrics.queries++;
         const retried = await source.query({ ...scoped, ids: missing, limit: missing.length });
         for (const event of retried) if (!returned.has(event.id)) { returned.add(event.id); events.push(event); }
         const unavailable = batch.filter((id) => !returned.has(id)).length;
         this.counters.missingAtTransfer += unavailable;
-        if (publicHistory) this.historyMetrics.unavailable += unavailable;
+        if (metrics) metrics.unavailable += unavailable;
       }
       const imports = await Promise.allSettled(events.map(async (event) => {
         if (cancelled()) throw new Error("user synchronization revoked");
         if (!batch.includes(event.id) || !matchFilter(scoped, event)) throw new Error("peer returned event outside reconciliation scope");
-        try { await this.importEvent(event, destination); if (publicHistory) this.historyMetrics.accepted++; }
+        try { await this.importEvent(event, destination); if (metrics) metrics.accepted++; }
         catch (error) {
-          if (publicHistory) this.historyMetrics.rejected++;
+          if (metrics) metrics.rejected++;
           if (!(error instanceof AdmissionError)) throw error;
           // Admission remains authoritative. Coverage means examined, with
           // rejected/protected events reported as exclusions, never stored by bypass.
@@ -222,7 +239,7 @@ export class SyncEngine {
     await this.local.subscribe("live-local", [{}]);
     const latest = this.state.coverage.at(-1)?.until;
     const now = Math.floor(Date.now() / 1000);
-    if (!this.state.pending.length && latest !== undefined && now > latest) this.state.pending.push({ since: latest + 1, until: now });
+    if (!this.state.pending.length && latest !== undefined && now > latest) this.state.pending.push({ kind: "catchup", since: latest + 1, until: now });
     this.phase = "live";
   }
   async run() {
@@ -235,26 +252,29 @@ export class SyncEngine {
       try {
         if (!this.local.connected || !this.peer.connected) await this.connect();
         if (this.state.pending.length) {
-          const window = this.state.pending[0]; this.activeWindow = window; this.phase = "history";
+          const window = this.state.pending[0]; this.activeWindow = window; this.phase = window.kind;
           try {
-            await this.transferWindow(window);
+            await this.transferWindow(window, {}, this.peer, this.local, false, () => false, window.kind);
             this.state.pending.shift(); this.state.coverage = mergeCoverage([...this.state.coverage, window]);
-            await this.save(); this.lastError = null;
+            if (window.kind === "backfill") this.state.backfillCompleted = mergeCoverage([...(this.state.backfillCompleted ?? []), window]);
+            await this.save(); this.lastError = null; this.jobMetrics[window.kind].lastError = null;
           } catch (error) {
-            if (error instanceof CapacityError) { this.state.pending.splice(0, 1, ...splitWindow(window)); await this.save(); }
+            if (error instanceof CapacityError) { this.state.pending.splice(0, 1, ...splitWindow(window).map(part => ({ ...part, kind: window.kind }))); await this.save(); }
             else throw error;
           } finally { this.activeWindow = null; }
         } else {
           const latest = this.state.coverage.at(-1)?.until, now = Math.floor(Date.now() / 1000);
-          // Also repair gaps accumulated while the initial history was still
+          // Also repair gaps accumulated while the initial catch-up was still
           // pending; a reconnect alone cannot checkpoint those later intervals.
           if (latest !== undefined && now - latest >= 60) {
-            this.state.pending.push({ since: latest + 1, until: now }); await this.save();
+            this.state.pending.push({ kind: "catchup", since: latest + 1, until: now }); await this.save();
           } else { this.phase = this.lastError ? "attention" : "live"; await delay(250); }
         }
         this.retryDelay = 1000;
       } catch (error) {
         if (!this.paused) {
+          const kind = this.activeWindow?.kind ?? this.state.pending[0]?.kind;
+          if (kind) this.jobMetrics[kind].lastError = (error as Error).message.slice(0, 300);
           this.fail(error as Error); this.counters.retries++; this.peer.close();
           await delay(this.retryDelay + Math.random() * this.retryDelay / 2);
           this.retryDelay = Math.min(60000, this.retryDelay * 2);
@@ -314,12 +334,14 @@ export class SyncEngine {
       this.channelRates = {
         liveReceived: (this.liveMetrics.received - this.channelSample.liveReceived) / channelElapsed,
         liveEvents: (this.liveMetrics.accepted - this.channelSample.liveEvents) / channelElapsed,
-        historyEvents: (this.historyMetrics.accepted - this.channelSample.historyEvents) / channelElapsed,
+        catchupEvents: (this.jobMetrics.catchup.accepted - this.channelSample.catchupEvents) / channelElapsed,
+        backfillEvents: (this.jobMetrics.backfill.accepted - this.channelSample.backfillEvents) / channelElapsed,
         liveBytes: (this.livePeer.traffic.receivedBytes - this.channelSample.liveBytes) / channelElapsed,
-        historyBytes: (this.peer.traffic.receivedBytes - this.channelSample.historyBytes) / channelElapsed,
+        peerBytes: (this.peer.traffic.receivedBytes - this.channelSample.peerBytes) / channelElapsed,
       };
-      this.channelSample = { at: Date.now(), liveReceived: this.liveMetrics.received, liveEvents: this.liveMetrics.accepted, historyEvents: this.historyMetrics.accepted,
-        liveBytes: this.livePeer.traffic.receivedBytes, historyBytes: this.peer.traffic.receivedBytes };
+      this.channelSample = { at: Date.now(), liveReceived: this.liveMetrics.received, liveEvents: this.liveMetrics.accepted,
+        catchupEvents: this.jobMetrics.catchup.accepted, backfillEvents: this.jobMetrics.backfill.accepted,
+        liveBytes: this.livePeer.traffic.receivedBytes, peerBytes: this.peer.traffic.receivedBytes };
     }
     const elapsed = (Date.now() - this.sample.at) / 1000;
     if (elapsed >= 1) {
@@ -329,21 +351,30 @@ export class SyncEngine {
       this.sample = { at: Date.now(), requests: this.counters.requests, events: this.counters.downloaded + this.counters.uploaded, bytes: this.counters.bytes };
     }
     const currentError = this.lastError ?? this.liveError;
-    return { paused: this.paused, phase: this.paused ? "paused" : currentError ? "attention" : this.activeWindow ? "history" : this.phase, localRelay: this.config.localRelay, peer: this.config.peers[0],
+    const jobStatus = (kind: PublicJob["kind"]) => {
+      const active = this.activeWindow?.kind === kind ? this.activeWindow : null;
+      const metrics = this.jobMetrics[kind];
+      return { ...metrics, state: this.paused ? "paused" : active ? metrics.lastError ? "retrying" : "running" : metrics.lastError ? "needs attention" : this.state.pending.some(job => job.kind === kind) ? "pending" : "idle",
+        activeWindow: active, pendingWindows: this.state.pending.filter(job => job.kind === kind).length,
+        identified: active ? [...this.transfers].reduce((n, job) => n + job.total, 0) : 0,
+        remaining: active ? [...this.transfers].reduce((n, job) => n + job.remaining, 0) : 0,
+        pendingRequests: active ? this.peer.pendingRequests : 0,
+        eventsPerSecond: this.channelRates[kind === "catchup" ? "catchupEvents" : "backfillEvents"],
+      };
+    };
+    return { paused: this.paused, phase: this.paused ? "paused" : currentError ? "attention" : this.activeWindow ? this.activeWindow.kind : this.phase, localRelay: this.config.localRelay, peer: this.config.peers[0],
       live: { ...this.liveMetrics, error: this.liveError, state: this.paused ? "paused" : this.livePeer.connected ? "live" : this.liveError ? "draining / reconnecting" : "connecting",
         queue: this.incoming.length, queueBytes: queueBytes(this.incoming), receivedBytes: this.livePeer.traffic.receivedBytes,
         subscriptions: this.livePeer.traffic.subscriptions, receivedEventsPerSecond: this.channelRates.liveReceived, eventsPerSecond: this.channelRates.liveEvents, bytesPerSecond: this.channelRates.liveBytes },
-      history: { ...this.historyMetrics, queries: this.peer.traffic.queries, pendingRequests: this.peer.pendingRequests,
-        receivedBytes: this.peer.traffic.receivedBytes, eventsPerSecond: this.channelRates.historyEvents, bytesPerSecond: this.channelRates.historyBytes },
+      catchup: { ...jobStatus("catchup"), latestCovered: this.state.coverage.at(-1)?.until ?? null },
+      backfill: { ...jobStatus("backfill"), completedWindows: this.state.backfillCompleted ?? [] },
       connected: { local: this.local.connected, peer: this.peer.connected, live: this.livePeer.connected },
       coverage: { oldest: this.state.coverage[0]?.since ?? null, latest: this.state.coverage.at(-1)?.until ?? null, windows: this.state.coverage },
-      activeWindow: this.activeWindow, pendingWindows: this.state.pending.length,
       queues: { downloads: this.incoming.length, uploads: this.state.outgoing.length }, rates: this.rates,
-      historyTransfers: { active: this.transfers.size, identified: [...this.transfers].reduce((n, job) => n + job.total, 0), remaining: [...this.transfers].reduce((n, job) => n + job.remaining, 0) },
       queueBytes: { downloads: queueBytes(this.incoming), uploads: queueBytes(this.state.outgoing) },
       pendingRequests: this.peer.pendingRequests + this.local.pendingRequests,
       pendingAcks: this.peer.pendingAcks + this.local.pendingAcks,
-      coverageMeaning: "Processed peer windows; policy-skipped and unavailable events are counted separately",
+      coverageMeaning: "Catch-up covers the initial hour and later gaps; backfill covers only requested older windows. Policy-skipped and unavailable events are counted separately",
       counters: this.counters, lastError: currentError, lastActivity: this.lastActivity, limits: this.config };
   }
   stop() { this.stopped = true; this.local.close(); this.peer.close(); this.livePeer.close(); }

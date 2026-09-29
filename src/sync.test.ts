@@ -7,7 +7,7 @@ import { SyncEngine } from "./sync.ts";
 import { Negentropy, NegentropyStorageVector, bytesToHex, hexToBytes } from "./negentropy.ts";
 import type { NostrEvent } from "nostr-tools";
 import { SyncSessions, validateAuth, validateProof } from "./sync-sessions.ts";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -60,10 +60,29 @@ describe("native synchronization boundaries", () => {
       const acknowledged = new SyncEngine(config, store, directory); await acknowledged.load();
       assert.equal(acknowledged.userOutbox(pubkey).length, 0);
       await acknowledged.control("backfill");
-      assert.deepEqual(acknowledged.state.pending, [{ since: 6400, until: 9999 }]);
+      assert.deepEqual(acknowledged.state.pending, [{ kind: "backfill", since: 6400, until: 9999 }]);
       const backfill = new SyncEngine(config, store, directory); await backfill.load();
-      assert.deepEqual(backfill.state.pending, [{ since: 6400, until: 9999 }]);
+      assert.deepEqual(backfill.state.pending, [{ kind: "backfill", since: 6400, until: 9999 }]);
       await assert.rejects(backfill.control("backfill"), /finish current coverage/);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+  it("classifies saved automatic gaps and requested older windows separately", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "nosu-sync-jobs-"));
+    const config = parseSyncConfig({ localRelay: "ws://localhost/relay", peers: ["wss://relay.ditto.pub"] });
+    const store = { queryItems: async () => [] };
+    try {
+      await writeFile(join(directory, "sync.json"), JSON.stringify({ version: 1, coverage: [{ since: 100, until: 200 }], pending: [{ since: 201, until: 300 }, { since: 1, until: 99 }], outgoing: [] }));
+      const engine = new SyncEngine(config, store, directory); await engine.load();
+      assert.deepEqual(engine.state.pending.map(job => job.kind), ["catchup", "backfill"]);
+      engine.jobMetrics.catchup.reconciliations = 2;
+      engine.jobMetrics.backfill.accepted = 3;
+      const status = engine.status();
+      assert.equal(status.catchup.pendingWindows, 1);
+      assert.equal(status.backfill.pendingWindows, 1);
+      assert.equal(status.catchup.reconciliations, 2);
+      assert.equal(status.catchup.accepted, 0);
+      assert.equal(status.backfill.accepted, 3);
+      assert.equal(status.backfill.reconciliations, 0);
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });
