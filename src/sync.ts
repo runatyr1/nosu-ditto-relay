@@ -10,7 +10,7 @@ export function parseSyncConfig(value: unknown): SyncConfig {
   if (!value || typeof value !== "object") throw new Error("sync config must be an object");
   const input = value as Record<string, unknown>;
   const config = { ...DEFAULT_LIMITS, historySeconds: 3600, ...input } as SyncConfig;
-  if (!Array.isArray(config.peers) || config.peers.length !== 1) throw new Error("exactly one peer is supported per daemon");
+  if (!Array.isArray(config.peers) || !config.peers.length || config.peers.length > 4 || new Set(config.peers).size !== config.peers.length) throw new Error("configure one to four distinct peers");
   for (const url of [config.localRelay, ...config.peers]) {
     if (typeof url !== "string" || !["ws:", "wss:"].includes(new URL(url).protocol)) throw new Error("relay URLs must use ws/wss");
   }
@@ -21,7 +21,7 @@ export function parseSyncConfig(value: unknown): SyncConfig {
   return config;
 }
 type PublicJob = Window & { kind: "catchup" | "backfill" };
-interface State { version: 1; coverage: Window[]; pending: PublicJob[]; backfillCompleted?: Window[]; outgoing: NostrEvent[]; privateOutgoing?: { pubkey: string; event: NostrEvent }[] }
+interface State { version: 1; coverage: Window[]; pending: PublicJob[]; backfillCompleted?: Window[]; outgoing: NostrEvent[]; privateOutgoing?: { pubkey: string; event: NostrEvent }[]; activePublicPeer?: string; lastCoveragePeer?: string }
 export interface ItemStore { queryItems(filter: Filter, options: { maxItems: number; signal: AbortSignal; includeAuthKinds?: boolean }): Promise<{ created_at: number; id: string }[]> }
 /** Merge only proven complete windows. Empty intervals still count as coverage. */
 export function mergeCoverage(windows: Window[]): Window[] {
@@ -36,7 +36,7 @@ export function mergeCoverage(windows: Window[]): Window[] {
 export class SyncEngine {
   readonly counters: SyncCounters = { requests: 0, downloaded: 0, uploaded: 0, rejected: 0, retries: 0, bytes: 0, policySkipped: 0, missingAtTransfer: 0 };
   readonly requestGate: Regulator; readonly uploadGate: Regulator;
-  readonly local: SyncSocket; readonly peer: SyncSocket; readonly livePeer: SyncSocket;
+  readonly local: SyncSocket; peer: SyncSocket; readonly livePeer: SyncSocket; readonly uploadPeer: SyncSocket;
   state: State = { version: 1, coverage: [], pending: [], backfillCompleted: [], outgoing: [] };
   paused = false; phase = "starting"; lastError: string | null = null; lastActivity: string | null = null;
   activeWindow: PublicJob | null = null;
@@ -44,12 +44,12 @@ export class SyncEngine {
   private stopped = false; private incoming: NostrEvent[] = []; private imported = new Set<string>();
   private sample = { at: Date.now(), requests: 0, events: 0, bytes: 0 };
   private rates = { requestsPerSecond: 0, eventsPerSecond: 0, bytesPerSecond: 0 };
-  private writing = Promise.resolve(); private retryDelay = 1000;
+  private writing = Promise.resolve(); private retryDelay = 1000; private peerIndex = 0;
   private liveError: string | null = null;
   readonly liveMetrics = { received: 0, accepted: 0, rejected: 0, overflows: 0, recoveredAt: null as string | null };
   readonly jobMetrics = {
-    catchup: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, lastError: null as string | null },
-    backfill: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, lastError: null as string | null },
+    catchup: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, nip77Refusals: 0, nip77LastSuccessAt: null as string | null, nip77LastFailure: null as string | null, nip77LastFailureAt: null as string | null, nextRetryAt: null as string | null, lastError: null as string | null },
+    backfill: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, nip77Refusals: 0, nip77LastSuccessAt: null as string | null, nip77LastFailure: null as string | null, nip77LastFailureAt: null as string | null, nextRetryAt: null as string | null, lastError: null as string | null },
   };
   private channelSample = { at: Date.now(), liveReceived: 0, liveEvents: 0, catchupEvents: 0, backfillEvents: 0, liveBytes: 0, peerBytes: 0 };
   private channelRates = { liveReceived: 0, liveEvents: 0, catchupEvents: 0, backfillEvents: 0, liveBytes: 0, peerBytes: 0 };
@@ -58,6 +58,7 @@ export class SyncEngine {
     this.local = new SyncSocket(config.localRelay, config, new Regulator(0), new Regulator(0), this.counters);
     this.peer = this.socket(config.peers[0]);
     this.livePeer = this.socket(config.peers[0]);
+    this.uploadPeer = this.socket(config.peers[0]);
     this.livePeer.onFailure = error => this.failLive(error);
     this.livePeer.onEvent = (event, sub) => {
       if (sub !== "live-peer" || this.paused) return;
@@ -75,6 +76,15 @@ export class SyncEngine {
     };
   }
   socket(url: string) { const socket = new SyncSocket(url, this.config, this.requestGate, this.uploadGate, this.counters); socket.onFailure = (error) => this.fail(error); return socket; }
+  private async rotatePublicPeer() {
+    if (this.config.peers.length < 2) return;
+    this.peer.close();
+    this.peerIndex = (this.peerIndex + 1) % this.config.peers.length;
+    this.peer = this.socket(this.config.peers[this.peerIndex]);
+    this.state.activePublicPeer = this.peer.url;
+    await this.save();
+    console.log(JSON.stringify({ level: "warn", msg: "sync_public_peer_changed", peer: this.peer.url }));
+  }
   isImported(id: string) { return this.imported.has(id); }
   userOutbox(pubkey: string) { return (this.state.privateOutgoing ?? []).filter(item => item.pubkey === pubkey).map(item => item.event); }
   async queueUserPublication(pubkey: string, event: NostrEvent) {
@@ -120,6 +130,10 @@ export class SyncEngine {
       if (!Array.isArray(saved.backfillCompleted)) throw new Error("invalid saved backfill coverage");
       for (const window of saved.backfillCompleted) if (!Number.isSafeInteger(window.since) || !Number.isSafeInteger(window.until) || window.since < 0 || window.since > window.until) throw new Error("invalid saved backfill coverage");
       this.state = saved;
+      if (saved.activePublicPeer && this.config.peers.includes(saved.activePublicPeer)) {
+        this.peerIndex = this.config.peers.indexOf(saved.activePublicPeer);
+        this.peer = this.socket(saved.activePublicPeer);
+      }
       // Relay-generated statistics remain local. Only client publications are
       // exported, including after loading an older persisted public queue.
       this.state.outgoing = this.state.outgoing.filter(event => event.pubkey !== this.localSignerPubkey);
@@ -138,7 +152,7 @@ export class SyncEngine {
     return this.writing;
   }
   async control(action: string) {
-    if (action === "pause") { this.paused = true; this.phase = "paused"; this.peer.close(); this.livePeer.close(); this.local.close(); }
+    if (action === "pause") { this.paused = true; this.phase = "paused"; this.peer.close(); this.livePeer.close(); this.uploadPeer.close(); this.local.close(); }
     else if (action === "resume" || action === "retry") {
       this.paused = false; this.lastError = null; this.retryDelay = 1000;
       this.jobMetrics.catchup.lastError = null; this.jobMetrics.backfill.lastError = null;
@@ -168,7 +182,18 @@ export class SyncEngine {
     const scoped = { ...filter, since: window.since, until: window.until };
     const items = await this.store.queryItems(scoped, { maxItems: this.config.maxItems, signal: AbortSignal.timeout(60000), includeAuthKinds: authenticated });
     if (metrics) metrics.reconciliations++;
-    const { need: ids } = await source.reconcile(scoped, items);
+    let ids: string[];
+    try {
+      ({ need: ids } = await source.reconcile(scoped, items));
+      if (metrics) { metrics.nip77LastSuccessAt = new Date().toISOString(); metrics.lastError = null; this.lastError = null; }
+    } catch (error) {
+      if (metrics) {
+        metrics.nip77LastFailure = (error as Error).message.slice(0, 300);
+        metrics.nip77LastFailureAt = new Date().toISOString();
+        if (/^(blocked:|rate-limited:)/.test((error as Error).message)) metrics.nip77Refusals++;
+      }
+      throw error;
+    }
     const transfer = { total: ids.length, remaining: ids.length }; this.transfers.add(transfer);
     try {
     for (let offset = 0; offset < ids.length; offset += this.config.batchSize) {
@@ -254,11 +279,13 @@ export class SyncEngine {
         if (!this.local.connected || !this.peer.connected) await this.connect();
         if (this.state.pending.length) {
           const window = this.state.pending[0]; this.activeWindow = window; this.phase = window.kind;
+          this.jobMetrics[window.kind].nextRetryAt = null;
           try {
             await this.transferWindow(window, {}, this.peer, this.local, false, () => false, window.kind);
             this.state.pending.shift(); this.state.coverage = mergeCoverage([...this.state.coverage, window]);
             if (window.kind === "backfill") this.state.backfillCompleted = mergeCoverage([...(this.state.backfillCompleted ?? []), window]);
-            await this.save(); this.lastError = null; this.jobMetrics[window.kind].lastError = null;
+            this.state.lastCoveragePeer = this.peer.url;
+            await this.save(); this.lastError = null; this.jobMetrics[window.kind].lastError = null; this.jobMetrics[window.kind].nextRetryAt = null;
           } catch (error) {
             if (error instanceof CapacityError) { this.state.pending.splice(0, 1, ...splitWindow(window).map(part => ({ ...part, kind: window.kind }))); await this.save(); }
             else throw error;
@@ -277,7 +304,10 @@ export class SyncEngine {
           const kind = this.activeWindow?.kind ?? this.state.pending[0]?.kind;
           if (kind) this.jobMetrics[kind].lastError = (error as Error).message.slice(0, 300);
           this.fail(error as Error); this.counters.retries++; this.peer.close();
-          await delay(this.retryDelay + Math.random() * this.retryDelay / 2);
+          if (/^(blocked:|rate-limited:)|relay (?:connection|response)|relay disconnected/i.test((error as Error).message)) await this.rotatePublicPeer();
+          const waitMs = this.retryDelay + Math.random() * this.retryDelay / 2;
+          if (kind) this.jobMetrics[kind].nextRetryAt = new Date(Date.now() + waitMs).toISOString();
+          await delay(waitMs);
           this.retryDelay = Math.min(60000, this.retryDelay * 2);
         }
       }
@@ -297,9 +327,9 @@ export class SyncEngine {
   }
   private async drainUploads() {
     while (!this.stopped) {
-      if (this.paused || !this.peer.connected || !this.state.outgoing.length) { await delay(100); continue; }
+      if (this.paused || !this.state.outgoing.length) { await delay(100); continue; }
       const event = this.state.outgoing[0];
-      try { await this.peer.publish(event); this.counters.uploaded++; this.state.outgoing.shift(); await this.save(); }
+      try { if (!this.uploadPeer.connected) await this.uploadPeer.connect(); await this.uploadPeer.publish(event); this.counters.uploaded++; this.state.outgoing.shift(); await this.save(); }
       catch (error) {
         this.fail(error as Error);
         if (error instanceof AdmissionError) { this.counters.rejected++; this.state.outgoing.shift(); await this.save(); }
@@ -363,20 +393,20 @@ export class SyncEngine {
         eventsPerSecond: this.channelRates[kind === "catchup" ? "catchupEvents" : "backfillEvents"],
       };
     };
-    return { paused: this.paused, phase: this.paused ? "paused" : currentError ? "attention" : this.activeWindow ? this.activeWindow.kind : this.phase, localRelay: this.config.localRelay, peer: this.config.peers[0],
+    return { paused: this.paused, phase: this.paused ? "paused" : currentError ? "attention" : this.activeWindow ? this.activeWindow.kind : this.phase, localRelay: this.config.localRelay, peer: this.peer.url, lastCoveragePeer: this.state.lastCoveragePeer ?? null,
       live: { ...this.liveMetrics, error: this.liveError, state: this.paused ? "paused" : this.livePeer.connected ? "live" : this.liveError ? "draining / reconnecting" : "connecting",
-        queue: this.incoming.length, queueBytes: queueBytes(this.incoming), receivedBytes: this.livePeer.traffic.receivedBytes,
+        peer: this.livePeer.url, queue: this.incoming.length, queueBytes: queueBytes(this.incoming), receivedBytes: this.livePeer.traffic.receivedBytes,
         subscriptions: this.livePeer.traffic.subscriptions, receivedEventsPerSecond: this.channelRates.liveReceived, eventsPerSecond: this.channelRates.liveEvents, bytesPerSecond: this.channelRates.liveBytes },
-      catchup: { ...jobStatus("catchup"), latestCovered: this.state.coverage.at(-1)?.until ?? null },
-      backfill: { ...jobStatus("backfill"), completedWindows: this.state.backfillCompleted ?? [] },
+      catchup: { ...jobStatus("catchup"), peer: this.peer.url, latestCovered: this.state.coverage.at(-1)?.until ?? null },
+      backfill: { ...jobStatus("backfill"), peer: this.peer.url, completedWindows: this.state.backfillCompleted ?? [] },
       connected: { local: this.local.connected, peer: this.peer.connected, live: this.livePeer.connected },
       coverage: { oldest: this.state.coverage[0]?.since ?? null, latest: this.state.coverage.at(-1)?.until ?? null, windows: this.state.coverage },
       queues: { downloads: this.incoming.length, uploads: this.state.outgoing.length }, rates: this.rates,
       queueBytes: { downloads: queueBytes(this.incoming), uploads: queueBytes(this.state.outgoing) },
       pendingRequests: this.peer.pendingRequests + this.local.pendingRequests,
-      pendingAcks: this.peer.pendingAcks + this.local.pendingAcks,
-      coverageMeaning: "Catch-up covers the initial hour and later gaps; backfill covers only requested older windows. Policy-skipped and unavailable events are counted separately",
+      pendingAcks: this.peer.pendingAcks + this.uploadPeer.pendingAcks + this.local.pendingAcks,
+      coverageMeaning: "Catch-up covers the initial hour and later gaps; backfill covers only requested older windows. Each window is checked against its selected peer, not the union of all peers. Policy-skipped and unavailable events are counted separately",
       counters: this.counters, lastError: currentError, lastActivity: this.lastActivity, limits: this.config };
   }
-  stop() { this.stopped = true; this.local.close(); this.peer.close(); this.livePeer.close(); }
+  stop() { this.stopped = true; this.local.close(); this.peer.close(); this.livePeer.close(); this.uploadPeer.close(); }
 }

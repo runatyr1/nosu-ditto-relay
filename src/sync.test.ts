@@ -85,6 +85,24 @@ describe("native synchronization boundaries", () => {
       assert.equal(status.backfill.reconciliations, 0);
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
+  it("keeps live and outbound on the primary when catch-up fails over, including after restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "nosu-sync-failover-"));
+    const primary = "wss://relay.ditto.pub/", fallback = "wss://relay.dreamith.to/";
+    const config = parseSyncConfig({ localRelay: "ws://localhost/relay", peers: [primary, fallback] });
+    try {
+      const engine = new SyncEngine(config, { queryItems: async () => [] }, directory); await engine.load();
+      await (engine as unknown as { rotatePublicPeer: () => Promise<void> }).rotatePublicPeer();
+      assert.equal(engine.status().catchup.peer, fallback);
+      assert.equal(engine.status().live.peer, primary);
+      assert.equal(engine.uploadPeer.url, primary);
+      const restarted = new SyncEngine(config, { queryItems: async () => [] }, directory); await restarted.load();
+      assert.equal(restarted.status().catchup.peer, fallback);
+      assert.equal(restarted.status().live.peer, primary);
+      await (restarted as unknown as { rotatePublicPeer: () => Promise<void> }).rotatePublicPeer();
+      assert.equal(restarted.status().catchup.peer, primary);
+      engine.stop(); restarted.stop();
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
 });
 
 describe("live recovery diagnostics", () => {
