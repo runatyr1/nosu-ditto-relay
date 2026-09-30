@@ -24,6 +24,7 @@ ENV NODE_ENV=production \
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json bun.lock tsconfig.json ./
+COPY service-config.json ./
 COPY src ./src
 COPY scripts ./scripts
 COPY public ./public

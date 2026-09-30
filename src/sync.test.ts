@@ -15,7 +15,14 @@ describe("native synchronization boundaries", () => {
   it("uses 25 IDs and 1 request/second without accepting unbounded settings", () => {
     const config = parseSyncConfig({ localRelay: "ws://localhost/relay", peers: ["wss://relay.ditto.pub"] });
     assert.equal(config.batchSize, 25); assert.equal(config.requestIntervalMs, 1000);
+    assert.equal(config.priorityProbeIntervalMs, 60000);
+    assert.deepEqual(config.livePeers, config.peers);
+    const deployed = parseSyncConfig({ localRelay: "ws://localhost/relay" });
+    assert.deepEqual(deployed.peers, ["wss://relay.ditto.pub/", "wss://relay.dreamith.to/", "wss://offchain.pub/"]);
+    assert.deepEqual(deployed.livePeers, [...deployed.peers, "wss://nos.lol/"]);
     assert.throws(() => parseSyncConfig({ ...config, maxQueue: 0 }));
+    assert.throws(() => parseSyncConfig({ ...config, priorityProbeIntervalMs: 0 }));
+    assert.throws(() => parseSyncConfig({ ...config, livePeers: ["wss://nos.lol/"] }));
     assert.throws(() => parseSyncConfig({ ...config, peers: ["https://relay.ditto.pub"] }));
   });
   it("splits inclusive history windows without gaps or overlap", () => {
@@ -87,19 +94,75 @@ describe("native synchronization boundaries", () => {
   });
   it("keeps live and outbound on the primary when catch-up fails over, including after restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "nosu-sync-failover-"));
-    const primary = "wss://relay.ditto.pub/", fallback = "wss://relay.dreamith.to/";
-    const config = parseSyncConfig({ localRelay: "ws://localhost/relay", peers: [primary, fallback] });
+    const primary = "wss://relay.ditto.pub/", fallback = "wss://relay.dreamith.to/", last = "wss://offchain.pub/";
+    const config = parseSyncConfig({ localRelay: "ws://localhost/relay", peers: [primary, fallback, last] });
     try {
       const engine = new SyncEngine(config, { queryItems: async () => [] }, directory); await engine.load();
-      await (engine as unknown as { rotatePublicPeer: () => Promise<void> }).rotatePublicPeer();
+      await (engine as unknown as { failoverPublicPeer: () => Promise<void> }).failoverPublicPeer();
       assert.equal(engine.status().catchup.peer, fallback);
       assert.equal(engine.status().live.peer, primary);
       assert.equal(engine.uploadPeer.url, primary);
       const restarted = new SyncEngine(config, { queryItems: async () => [] }, directory); await restarted.load();
       assert.equal(restarted.status().catchup.peer, fallback);
       assert.equal(restarted.status().live.peer, primary);
-      await (restarted as unknown as { rotatePublicPeer: () => Promise<void> }).rotatePublicPeer();
-      assert.equal(restarted.status().catchup.peer, primary);
+      await (restarted as unknown as { failoverPublicPeer: () => Promise<void> }).failoverPublicPeer();
+      assert.equal(restarted.status().catchup.peer, last);
+      await (restarted as unknown as { failoverPublicPeer: () => Promise<void> }).failoverPublicPeer();
+      assert.equal(restarted.status().catchup.peer, last);
+      engine.stop(); restarted.stop();
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+  it("checks higher-priority NIP-77 peers once per minute and returns between windows", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "nosu-sync-rotation-"));
+    const peers = ["wss://relay.ditto.pub/", "wss://relay.dreamith.to/", "wss://offchain.pub/"];
+    const config = parseSyncConfig({ localRelay: "ws://localhost/relay", peers });
+    try {
+      const engine = new SyncEngine(config, { queryItems: async () => [] }, directory); await engine.load();
+      const internals = engine as unknown as { failoverPublicPeer: () => Promise<void>; recoverPublicPeerIfDue: (at: number) => Promise<void>; probeSocket: (url: string) => SyncSocket };
+      await internals.failoverPublicPeer(); await internals.failoverPublicPeer();
+      const checked: string[] = [];
+      internals.probeSocket = (url) => ({ url, connect: async () => {}, reconcile: async () => { checked.push(url); if (url === peers[0]) throw new Error("refused"); return { need: [], have: [] }; }, close: () => {} }) as unknown as SyncSocket;
+      const started = Date.now();
+      engine.activeWindow = { kind: "catchup", since: 1, until: 2 };
+      await internals.recoverPublicPeerIfDue(started + 60000);
+      assert.equal(engine.peer.url, peers[2]);
+      assert.equal(checked.length, 0);
+      engine.activeWindow = null;
+      await internals.recoverPublicPeerIfDue(started + 60000);
+      assert.equal(engine.peer.url, peers[2]);
+      assert.deepEqual(checked, [peers[0]]);
+      await internals.recoverPublicPeerIfDue(started + 60001);
+      assert.deepEqual(checked, [peers[0]]);
+      await internals.recoverPublicPeerIfDue(started + 120000);
+      assert.equal(engine.peer.url, peers[1]);
+      assert.deepEqual(checked, [peers[0], peers[1]]);
+      assert.equal(engine.livePeer.url, peers[0]);
+      assert.equal(engine.uploadPeer.url, peers[0]);
+      const restarted = new SyncEngine(config, { queryItems: async () => [] }, directory); await restarted.load();
+      assert.equal(restarted.peer.url, peers[1]);
+      const resumed = restarted as unknown as { recoverPublicPeerIfDue: (at: number) => Promise<void>; probeSocket: (url: string) => SyncSocket };
+      resumed.probeSocket = (url) => ({ url, connect: async () => {}, reconcile: async () => ({ need: [], have: [] }), close: () => {} }) as unknown as SyncSocket;
+      await resumed.recoverPublicPeerIfDue(started + 120000);
+      assert.equal(restarted.peer.url, peers[0]);
+      engine.stop(); restarted.stop();
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+  it("uses nos.lol only as the last live fallback, then recovers to the primary", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "nosu-sync-live-priority-"));
+    const config = parseSyncConfig({ localRelay: "ws://localhost/relay" });
+    try {
+      const engine = new SyncEngine(config, { queryItems: async () => [] }, directory); await engine.load();
+      const internals = engine as unknown as { failoverLivePeer: () => Promise<void>; recoverLivePeerIfDue: (at: number) => Promise<void>; probeSocket: (url: string) => SyncSocket };
+      await internals.failoverLivePeer(); await internals.failoverLivePeer(); await internals.failoverLivePeer();
+      assert.equal(engine.livePeer.url, "wss://nos.lol/");
+      assert.ok(!config.peers.includes("wss://nos.lol/"));
+      const restarted = new SyncEngine(config, { queryItems: async () => [] }, directory); await restarted.load();
+      assert.equal(restarted.livePeer.url, "wss://nos.lol/");
+      const recovered = restarted as unknown as { recoverLivePeerIfDue: (at: number) => Promise<void>; probeSocket: (url: string) => SyncSocket };
+      recovered.probeSocket = (url) => ({ url, connect: async () => {}, query: async () => [], close: () => {} }) as unknown as SyncSocket;
+      await recovered.recoverLivePeerIfDue(Date.now());
+      assert.equal(restarted.livePeer.url, config.livePeers[0]);
+      assert.equal(restarted.peer.url, config.peers[0]);
       engine.stop(); restarted.stop();
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
@@ -153,6 +216,17 @@ describe("live recovery diagnostics", () => {
     assert.equal(status.phase, "attention");
     engine.lastError = null;
     assert.equal(engine.status().lastError, null);
+  });
+  it("drains a local live queue overflow without changing relay priority", () => {
+    const config = parseSyncConfig({ localRelay: "ws://localhost/relay", maxQueue: 1, batchSize: 1 });
+    const engine = new SyncEngine(config, { queryItems: async () => [] }, "/tmp/unused-sync-test");
+    const event = finalizeEvent({ kind: 1, created_at: 1, tags: [], content: "fixture" }, generateSecretKey());
+    (engine as unknown as { incoming: NostrEvent[] }).incoming.push(event);
+    engine.livePeer.onEvent?.(event, "live-peer");
+    assert.equal(engine.livePeer.url, config.livePeers[0]);
+    assert.equal((engine as unknown as { liveQueueDraining: boolean }).liveQueueDraining, true);
+    assert.equal((engine as unknown as { liveFailoverPending: boolean }).liveFailoverPending, false);
+    engine.stop();
   });
 });
 

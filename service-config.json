@@ -1,0 +1,15 @@
+{
+  "relays": {
+    "catchupAndBackfill": [
+      "wss://relay.ditto.pub/",
+      "wss://relay.dreamith.to/",
+      "wss://offchain.pub/"
+    ],
+    "live": [
+      "wss://relay.ditto.pub/",
+      "wss://relay.dreamith.to/",
+      "wss://offchain.pub/",
+      "wss://nos.lol/"
+    ]
+  }
+}

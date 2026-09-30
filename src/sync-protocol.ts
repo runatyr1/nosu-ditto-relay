@@ -51,6 +51,7 @@ export class SyncSocket {
   readonly traffic = { receivedBytes: 0, queries: 0, subscriptions: 0 };
   onEvent?: (event: NostrEvent, sub: string) => void;
   onClosed?: (sub: string, reason: string) => void;
+  onDisconnect?: () => void;
   onChallenge?: (challenge: string) => void;
   onFailure?: (error: Error) => void;
   constructor(readonly url: string, readonly limits: SyncLimits, readonly requests: Regulator,
@@ -85,6 +86,7 @@ export class SyncSocket {
       if (this.ws !== ws) return;
       this.authenticated = false;
       for (const listener of [...this.listeners]) listener(["DISCONNECTED"]);
+      this.onDisconnect?.();
     });
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => { ws.close(); reject(new Error("relay connection timeout")); }, 15000);
@@ -168,7 +170,7 @@ export class SyncSocket {
       await this.send(["REQ", sub, ...filters.map((filter) => ({ ...filter, limit: 0 }))]);
     }, 15000);
   }
-  async reconcile(filter: Filter, items: { created_at: number; id: string }[]): Promise<{ need: string[]; have: string[] }> {
+  async reconcile(filter: Filter, items: { created_at: number; id: string }[], timeoutMs = 300000): Promise<{ need: string[]; have: string[] }> {
     if (items.length >= this.limits.maxItems) throw new CapacityError("local reconciliation set exceeds cap");
     const storage = new NegentropyStorageVector();
     for (const item of items) storage.insertHex(item.created_at, item.id);
@@ -191,7 +193,7 @@ export class SyncSocket {
       }, async () => {
         await this.requests.wait(); this.counters.requests++;
         await this.send(["NEG-OPEN", sub, filter, bytesToHex(neg.initiate())]);
-      }, 300000);
+      }, timeoutMs);
     } finally { if (this.connected) await this.send(["NEG-CLOSE", sub]); }
   }
 }
