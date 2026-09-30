@@ -21,6 +21,7 @@ export function parseSyncConfig(value: unknown): SyncConfig {
   return config;
 }
 type PublicJob = Window & { kind: "catchup" | "backfill" };
+const LIVE_IDLE_PROBE_MS = 90000;
 interface State { version: 1; coverage: Window[]; pending: PublicJob[]; backfillCompleted?: Window[]; outgoing: NostrEvent[]; privateOutgoing?: { pubkey: string; event: NostrEvent }[]; activePublicPeer?: string; lastCoveragePeer?: string }
 export interface ItemStore { queryItems(filter: Filter, options: { maxItems: number; signal: AbortSignal; includeAuthKinds?: boolean }): Promise<{ created_at: number; id: string }[]> }
 /** Merge only proven complete windows. Empty intervals still count as coverage. */
@@ -46,7 +47,9 @@ export class SyncEngine {
   private rates = { requestsPerSecond: 0, eventsPerSecond: 0, bytesPerSecond: 0 };
   private writing = Promise.resolve(); private retryDelay = 1000; private peerIndex = 0;
   private liveError: string | null = null;
-  readonly liveMetrics = { received: 0, accepted: 0, rejected: 0, overflows: 0, recoveredAt: null as string | null };
+  private lastLiveEventAt = Date.now(); private lastLiveProbeAt = 0;
+  readonly liveMetrics = { received: 0, accepted: 0, rejected: 0, overflows: 0, probes: 0, staleDetections: 0,
+    lastProbeAt: null as string | null, recoveredAt: null as string | null };
   readonly jobMetrics = {
     catchup: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, nip77Refusals: 0, nip77LastSuccessAt: null as string | null, nip77LastFailure: null as string | null, nip77LastFailureAt: null as string | null, nextRetryAt: null as string | null, lastError: null as string | null },
     backfill: { accepted: 0, rejected: 0, unavailable: 0, reconciliations: 0, queries: 0, nip77Refusals: 0, nip77LastSuccessAt: null as string | null, nip77LastFailure: null as string | null, nip77LastFailureAt: null as string | null, nextRetryAt: null as string | null, lastError: null as string | null },
@@ -60,8 +63,14 @@ export class SyncEngine {
     this.livePeer = this.socket(config.peers[0]);
     this.uploadPeer = this.socket(config.peers[0]);
     this.livePeer.onFailure = error => this.failLive(error);
+    this.livePeer.onClosed = (sub, reason) => {
+      if (sub !== "live-peer") return;
+      this.failLive(new Error(`Live subscription closed: ${reason}`));
+      this.livePeer.close();
+    };
     this.livePeer.onEvent = (event, sub) => {
       if (sub !== "live-peer" || this.paused) return;
+      this.lastLiveEventAt = Date.now();
       this.liveMetrics.received++;
       if (this.incoming.length >= config.maxQueue || queueBytes([...this.incoming, event]) > config.maxQueueBytes) { this.liveMetrics.overflows++; this.failLive(new CapacityError("Live queue full; draining before reconnect. Missed intervals await live catch-up.")); this.livePeer.close(); return; }
       if (!this.imported.has(event.id)) this.incoming.push(event);
@@ -109,6 +118,7 @@ export class SyncEngine {
   }
   async reconnectLive() {
     await this.livePeer.connect(); await this.livePeer.subscribe("live-peer", [{}]);
+    this.lastLiveEventAt = Date.now(); this.lastLiveProbeAt = 0;
     if (this.livePeer.connected && this.liveError) {
       this.liveError = null; this.liveMetrics.recoveredAt = new Date().toISOString();
       console.log(JSON.stringify({ level: "info", msg: "sync_live_recovered" }));
@@ -316,7 +326,12 @@ export class SyncEngine {
   private async maintainLive() {
     let retry = 1000;
     while (!this.stopped) {
-      if (this.paused || !this.local.connected || this.livePeer.connected || this.incoming.length > this.config.maxQueue / 2) { await delay(250); continue; }
+      if (this.paused || !this.local.connected || this.incoming.length > this.config.maxQueue / 2) { await delay(250); continue; }
+      if (this.livePeer.connected) {
+        try { await this.probeLiveIfIdle(); }
+        catch (error) { this.failLive(error as Error); this.counters.retries++; this.livePeer.close(); }
+        await delay(250); continue;
+      }
       try {
         await this.reconnectLive(); retry = 1000;
       } catch (error) {
@@ -324,6 +339,18 @@ export class SyncEngine {
         this.livePeer.close(); await delay(retry + Math.random() * retry / 2); retry = Math.min(60000, retry * 2);
       }
     }
+  }
+  private async probeLiveIfIdle(now = Date.now()) {
+    if (now - this.lastLiveEventAt < LIVE_IDLE_PROBE_MS || now - this.lastLiveProbeAt < LIVE_IDLE_PROBE_MS) return;
+    this.lastLiveProbeAt = now;
+    this.liveMetrics.probes++; this.liveMetrics.lastProbeAt = new Date(now).toISOString();
+    const recent = await this.livePeer.query({ since: Math.floor((now - LIVE_IDLE_PROBE_MS) / 1000), limit: 1 }, 15000);
+    if (recent.length && this.lastLiveEventAt <= now) {
+      this.liveMetrics.staleDetections++;
+      throw new Error("Live subscription silent while peer has recent events; reconnecting");
+    }
+    await this.livePeer.subscribe("live-peer", [{}]);
+    this.lastLiveEventAt = Date.now();
   }
   private async drainUploads() {
     while (!this.stopped) {

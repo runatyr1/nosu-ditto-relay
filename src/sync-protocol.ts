@@ -50,6 +50,7 @@ export class SyncSocket {
   pendingAcks = 0;
   readonly traffic = { receivedBytes: 0, queries: 0, subscriptions: 0 };
   onEvent?: (event: NostrEvent, sub: string) => void;
+  onClosed?: (sub: string, reason: string) => void;
   onChallenge?: (challenge: string) => void;
   onFailure?: (error: Error) => void;
   constructor(readonly url: string, readonly limits: SyncLimits, readonly requests: Regulator,
@@ -60,6 +61,7 @@ export class SyncSocket {
     const ws = new WebSocket(this.url);
     this.ws = ws; this.authenticated = false; this.challenge = undefined;
     ws.addEventListener("message", ({ data }) => {
+      if (this.ws !== ws) return;
       const text = typeof data === "string" ? data : "";
       if (Buffer.byteLength(text) > this.limits.maxMessageBytes) {
         this.onFailure?.(new CapacityError("peer message exceeds configured size")); ws.close(); return;
@@ -73,12 +75,14 @@ export class SyncSocket {
           this.challenge = frame[1]; this.onChallenge?.(frame[1]);
         }
         for (const listener of [...this.listeners]) listener(frame);
+        if (frame[0] === "CLOSED" && typeof frame[1] === "string") this.onClosed?.(frame[1], String(frame[2]));
         if (frame[0] === "EVENT" && typeof frame[1] === "string" && frame[2]) {
           this.onEvent?.(frame[2] as NostrEvent, frame[1]);
         }
       } catch { /* A malformed peer frame cannot alter local state. */ }
     });
     ws.addEventListener("close", () => {
+      if (this.ws !== ws) return;
       this.authenticated = false;
       for (const listener of [...this.listeners]) listener(["DISCONNECTED"]);
     });
@@ -116,10 +120,10 @@ export class SyncSocket {
     if (!this.connected) throw new Error("relay disconnected while regulating traffic");
     this.ws!.send(text); this.counters.bytes += bytes;
   }
-  async query(filter: Filter): Promise<NostrEvent[]> {
-    return this.requests.download(() => this.queryBatch(filter));
+  async query(filter: Filter, timeoutMs = 60000): Promise<NostrEvent[]> {
+    return this.requests.download(() => this.queryBatch(filter, timeoutMs));
   }
-  private async queryBatch(filter: Filter): Promise<NostrEvent[]> {
+  private async queryBatch(filter: Filter, timeoutMs: number): Promise<NostrEvent[]> {
     const sub = randomUUID(); const events = new Map<string, NostrEvent>();
     this.pendingRequests++;
     try {
@@ -132,7 +136,7 @@ export class SyncSocket {
           if (events.size > this.limits.maxQueue) reject(new CapacityError("download batch exceeds queue cap"));
         } else if (frame[0] === "EOSE") resolve([...events.values()]);
         else if (frame[0] === "CLOSED") reject(new AdmissionError(String(frame[2])));
-      }, async () => { await this.requests.wait(); this.counters.requests++; this.traffic.queries++; await this.send(["REQ", sub, filter]); });
+      }, async () => { await this.requests.wait(); this.counters.requests++; this.traffic.queries++; await this.send(["REQ", sub, filter]); }, timeoutMs);
     } finally { this.pendingRequests--; if (this.connected) await this.send(["CLOSE", sub]); }
   }
   async publish(event: NostrEvent) {
@@ -155,9 +159,14 @@ export class SyncSocket {
     }, () => this.send(["AUTH", event]));
   }
   async subscribe(sub: string, filters: Filter[]) {
-    await this.requests.wait(); this.counters.requests++;
-    this.traffic.subscriptions++;
-    await this.send(["REQ", sub, ...filters.map((filter) => ({ ...filter, limit: 0 }))]);
+    await this.watch<void>((frame, resolve, reject) => {
+      if (frame[1] !== sub) return;
+      if (frame[0] === "EOSE") resolve();
+      else if (frame[0] === "CLOSED") reject(new AdmissionError(String(frame[2])));
+    }, async () => {
+      await this.requests.wait(); this.counters.requests++; this.traffic.subscriptions++;
+      await this.send(["REQ", sub, ...filters.map((filter) => ({ ...filter, limit: 0 }))]);
+    }, 15000);
   }
   async reconcile(filter: Filter, items: { created_at: number; id: string }[]): Promise<{ need: string[]; have: string[] }> {
     if (items.length >= this.limits.maxItems) throw new CapacityError("local reconciliation set exceeds cap");

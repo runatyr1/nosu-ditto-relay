@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
 import { mergeCoverage, parseSyncConfig } from "./sync.ts";
-import { splitWindow, Regulator } from "./sync-protocol.ts";
+import { splitWindow, Regulator, SyncSocket, DEFAULT_LIMITS } from "./sync-protocol.ts";
 import { SyncEngine } from "./sync.ts";
 import { Negentropy, NegentropyStorageVector, bytesToHex, hexToBytes } from "./negentropy.ts";
 import type { NostrEvent } from "nostr-tools";
@@ -106,6 +106,32 @@ describe("native synchronization boundaries", () => {
 });
 
 describe("live recovery diagnostics", () => {
+  it("requires live subscription acknowledgement and detects relay closure", async () => {
+    const server = Bun.serve({ port: 0, fetch(req, server) { if (server.upgrade(req)) return; return new Response("fixture"); },
+      websocket: { message(ws, message) {
+        const frame = JSON.parse(String(message));
+        if (frame[0] !== "REQ") return;
+        ws.send(JSON.stringify([frame[1] === "rejected" ? "CLOSED" : "EOSE", frame[1], "blocked: fixture"]));
+      } },
+    });
+    const counters = { requests: 0, downloaded: 0, uploaded: 0, rejected: 0, retries: 0, bytes: 0, policySkipped: 0, missingAtTransfer: 0 };
+    const socket = new SyncSocket(`ws://localhost:${server.port}`, DEFAULT_LIMITS, new Regulator(0), new Regulator(0), counters);
+    try {
+      await socket.connect();
+      await socket.subscribe("accepted", [{}]);
+      await assert.rejects(socket.subscribe("rejected", [{}]), /blocked: fixture/);
+    } finally { socket.close(); server.stop(true); }
+  });
+  it("recognizes a silent live subscription when the same relay has recent events", async () => {
+    const engine = new SyncEngine(parseSyncConfig({ localRelay: "ws://localhost/relay", peers: ["wss://relay.ditto.pub"] }), { queryItems: async () => [] }, "/tmp/unused-sync-test");
+    const now = Date.now();
+    (engine as unknown as { lastLiveEventAt: number }).lastLiveEventAt = now - 120000;
+    engine.livePeer.query = async () => [{ id: "fixture" }] as NostrEvent[];
+    await assert.rejects((engine as unknown as { probeLiveIfIdle: (now: number) => Promise<void> }).probeLiveIfIdle(now), /silent/);
+    assert.equal(engine.liveMetrics.probes, 1);
+    assert.equal(engine.liveMetrics.staleDetections, 1);
+    engine.stop();
+  });
   it("clears the live warning on successful resubscription without hiding other failures", async () => {
     const engine = new SyncEngine(parseSyncConfig({ localRelay: "ws://localhost/relay", peers: ["wss://relay.ditto.pub"] }), { queryItems: async () => [] }, "/tmp/unused-sync-test");
     let connected = false;
