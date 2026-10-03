@@ -1,4 +1,8 @@
 {
+  "deployment": {
+    "relayPath": "/relay",
+    "syncPath": "/relay-sync"
+  },
   "relays": {
     "catchupAndBackfill": [
       "wss://relay.ditto.pub/",
